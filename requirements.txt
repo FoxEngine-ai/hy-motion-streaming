@@ -22,3 +22,4 @@ requests==2.32.4
 openai==1.78.1
 
 fbxsdkpy==2020.1.post2
+gradio==5.38.2

@@ -107,6 +107,55 @@ class T2MRuntime:
         else:
             print(f">>> T2MRuntime loaded in IP {self.local_ip}, devices={device_info}")
 
+    def _print_smplh_data(self, model_output: dict, text: str) -> None:
+        """Print SMPL-H motion data for debugging and analysis."""
+        print(f"\n{'='*60}")
+        print(f"SMPL-H Data for: '{text}'")
+        print(f"{'='*60}")
+        
+        if not isinstance(model_output, dict):
+            print("❌ Model output is not a dictionary")
+            return
+            
+        # Extract motion data
+        k3d = model_output.get('keypoints3d', None)
+        transl = model_output.get('transl', None)
+        rot6d = model_output.get('rot6d', None)
+        root_rot = model_output.get('root_rotations_mat', None)
+        
+        if k3d is not None:
+            print(f"📊 Keypoints3D:")
+            print(f"   Shape: {k3d.shape} (Batch={k3d.shape[0]}, Frames={k3d.shape[1]}, Joints={k3d.shape[2]})")
+            print(f"   First frame, first 3 joints XYZ:")
+            for joint_idx in range(min(3, k3d.shape[2])):
+                pos = k3d[0, 0, joint_idx, :].cpu().numpy()
+                print(f"     Joint {joint_idx}: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+            
+            print(f"   Last frame, first 3 joints XYZ:")
+            for joint_idx in range(min(3, k3d.shape[2])):
+                pos = k3d[0, -1, joint_idx, :].cpu().numpy()
+                print(f"     Joint {joint_idx}: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+        
+        if transl is not None:
+            print(f"\n📊 Translation:")
+            print(f"   Shape: {transl.shape} (Batch={transl.shape[0]}, Frames={transl.shape[1]})")
+            print(f"   First frame: [{transl[0, 0, 0]:.3f}, {transl[0, 0, 1]:.3f}, {transl[0, 0, 2]:.3f}]")
+            print(f"   Last frame:  [{transl[0, -1, 0]:.3f}, {transl[0, -1, 1]:.3f}, {transl[0, -1, 2]:.3f}]")
+        
+        if rot6d is not None:
+            print(f"\n📊 Rotation6D:")
+            print(f"   Shape: {rot6d.shape} (Batch={rot6d.shape[0]}, Frames={rot6d.shape[1]}, Joints={rot6d.shape[2]})")
+            print(f"   First frame, root joint: {rot6d[0, 0, 0, :].cpu().numpy()}")
+            print(f"   Last frame, root joint:  {rot6d[0, -1, 0, :].cpu().numpy()}")
+        
+        if root_rot is not None:
+            print(f"\n📊 Root Rotations:")
+            print(f"   Shape: {root_rot.shape} (Batch={root_rot.shape[0]}, Frames={root_rot.shape[1]})")
+            print(f"   First frame rotation matrix:")
+            print(f"     {root_rot[0, 0, :, :].cpu().numpy()}")
+        
+        print(f"{'='*60}\n")
+
     def load(self):
         if self._loaded:
             return
@@ -312,6 +361,11 @@ class T2MRuntime:
             self._release_pipeline(pi)
 
         ts = _now()
+        
+        # Print SMPL-H data if requested (for CLI debugging)
+        if hasattr(self, 'print_smplh_data') and self.print_smplh_data:
+            self._print_smplh_data(model_output, text)
+        
         save_data, base_filename = save_visualization_data(
             output=model_output,
             text=text if original_text is None else original_text,

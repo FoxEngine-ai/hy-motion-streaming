@@ -1,0 +1,44 @@
+# Docker ignore file for HY-Motion 1.0
+
+# Git directory
+.git
+.gitignore
+
+# Python virtual environment
+venv
+.env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Logs and temporary files
+*.log
+tmp
+
+# IDE specific files
+.idea
+.vscode
+*.swp
+*.swo
+
+# Large data files that should be downloaded separately
+ckpts/
+assets/
+downloaded_models/
+
+# Generated output files
+output/
+
+# Build artifacts
+build
+dist
+*.egg-info
+
+# Local development files
+*.local
+*.bak
+
+# Docker specific
+Dockerfile
+.dockerignore

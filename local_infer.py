@@ -317,6 +317,7 @@ def main():
     parser.add_argument("--disable_rewrite", action="store_true", help="Disable text rewriting")
     parser.add_argument("--disable_duration_est", action="store_true", help="Disable duration estimation")
     parser.add_argument("--num_seeds", type=int, default=4, help="Number of random seeds")
+    parser.add_argument("--print_smplh_data", action="store_true", help="Print SMPL-H data for each frame")
     args = parser.parse_args()
 
     # check required files
@@ -346,6 +347,9 @@ def main():
         prompt_engineering_host=args.prompt_engineering_host,
         prompt_engineering_model_path=args.prompt_engineering_model_path,
     )
+    
+    # Set SMPL-H data printing flag
+    runtime.print_smplh_data = args.print_smplh_data
 
     # set validation steps
     if args.validation_steps is not None:

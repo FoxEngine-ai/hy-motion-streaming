@@ -1,0 +1,51 @@
+# Dockerfile for HY-Motion 1.0 with Python 3.12 and CUDA support
+# Using official Python image with CUDA support for faster builds
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3-pip \
+    python3-dev \
+    build-essential \
+    git \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up environment variables for CUDA
+ENV CUDA_HOME=/usr/local/cuda
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV PATH=/usr/local/cuda/bin:${PATH}
+
+# Upgrade pip and install build tools
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# Create and set up working directory
+WORKDIR /app
+COPY . /app
+
+# Install Python dependencies with retry logic
+RUN pip install --no-cache-dir numpy scipy && \
+    pip install --no-cache-dir PyYAML==6.0 && \
+    pip install --no-cache-dir -r requirements.txt || \
+    (sleep 30 && pip install --no-cache-dir -r requirements.txt)
+
+# Install PyTorch with CUDA 12.1 support
+RUN pip install --no-cache-dir \
+    torch==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121 \
+    torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121 \
+    torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+
+# Clean up
+RUN apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Set up entry point
+ENV PYTHONPATH=/app
+
+# Default command (can be overridden)
+CMD ["bash"]
