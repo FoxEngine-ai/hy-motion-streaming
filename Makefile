@@ -149,6 +149,21 @@ run-gradio-docker:
 	    -e PROMPT_MODEL_PATH=/app/ckpts/Text2MotionPrompter \
 	    hymotion:latest python gradio_app_streaming.py
 
+
+ run-server:
+	@echo "Running Streaming Gradio web interface with Docker..."
+	mkdir -p $(PWD)/output/gradio
+	docker run -it --rm \
+	    --gpus all \
+	    -p 7860:7860 \
+	    -v $(PWD):/app \
+	    -v $(PWD)/ckpts:/app/ckpts \
+	    -v $(PWD)/output:/app/output \
+	    -e USE_HF_MODELS=0 \
+	    -e PYTHONPATH=/app \
+	    -e PROMPT_MODEL_PATH=/app/ckpts/Text2MotionPrompter \
+	    hymotion:latest python streaming_server.py
+
 # Download and setup streaming-specific models
 setup-streaming:
 	@echo "Setting up streaming environment..."

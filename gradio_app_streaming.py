@@ -990,11 +990,7 @@ class StreamingGradioApp:
     def _get_header_md(self) -> str:
         """Get header markdown."""
         return """
-        # 🎬 HY-Motion 1.0 - Streaming Interface
-        
-        **Real-time Frame-by-Frame Motion Generation**
-        
-        Watch your motion being generated progressively, frame by frame!
+        #Streaming Interface
         """
     
     def _get_placeholder_html(self) -> str:
