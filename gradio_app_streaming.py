@@ -346,21 +346,21 @@ def streaming_generate_motion(
     output_format: str,
     original_text: Optional[str] = None,
     output_dir: Optional[str] = None,
-) -> Generator[str, None, None]:
+) -> Generator[Tuple[str, List[str]], None, None]:
     """
-    Streaming version of motion generation that yields HTML updates.
+    Streaming version of motion generation that yields HTML updates and file lists.
     
     Args:
         text: Input text prompt
         seeds_csv: Comma-separated seed values
         motion_duration: Duration in seconds
         cfg_scale: CFG scale
-        output_format: Output format
+        output_format: Output format (json or dict)
         original_text: Original text (before rewriting)
         output_dir: Output directory
         
     Yields:
-        HTML content updates for Gradio streaming
+        Tuple of (HTML content updates, list of file paths) for Gradio streaming
     """
     runtime = _init_runtime_if_needed()
     
@@ -420,7 +420,7 @@ def streaming_generate_motion(
                     </div>
                     """
                     print(f">>> Putting frame HTML in queue (size: {_frame_queue.qsize()})")
-                    _frame_queue.put(frame_html)
+                    _frame_queue.put((frame_html, []))
                     
                     if frame_data.get("completed"):
                         # Final result - generate the full visualization
@@ -452,6 +452,56 @@ def streaming_generate_motion(
                                 output_filename=file_path,
                             )
                             print(f">>> Data saved with base filename: {base_filename}")
+                            
+                            # Generate JSON files if requested
+                            json_files = []
+                            if output_format == "json":
+                                print(f">>> Generating JSON files...")
+                                json_files = runtime._generate_json_files(
+                                    visualization_data=memory_data,
+                                    output_dir=None,  # Use default
+                                    json_filename=file_path,
+                                )
+                                print(f">>> JSON files generated: {json_files}")
+
+                            # Debug: Print full directory structure and file info
+                            from hymotion.utils.visualize_mesh_web import get_output_dir
+                            output_base = get_output_dir("output/gradio")
+                            print(f"\n{'='*60}")
+                            print(f"SAVED FILES DEBUG INFO")
+                            print(f"{'='*60}")
+                            print(f"Output directory: {output_base}")
+                            print(f"Base filename: {base_filename}")
+                            print(f"\nGenerated files:")
+
+                            # List all files for this generation
+                            meta_file = os.path.join(output_base, f"{base_filename}_meta.json")
+                            npz_file = os.path.join(output_base, f"{base_filename}_000.npz")
+
+                            if os.path.exists(meta_file):
+                                print(f"\n📄 Metadata file: {meta_file}")
+                                print(f"   Size: {os.path.getsize(meta_file)} bytes")
+                                with open(meta_file, 'r') as f:
+                                    meta_content = json.load(f)
+                                    print(f"   Content: {json.dumps(meta_content, indent=2)}")
+
+                            if os.path.exists(npz_file):
+                                print(f"\n📦 Motion data file: {npz_file}")
+                                print(f"   Size: {os.path.getsize(npz_file)} bytes")
+                                npz_data = np.load(npz_file, allow_pickle=True)
+                                print(f"   Arrays in NPZ:")
+                                for key in npz_data.keys():
+                                    arr = npz_data[key]
+                                    print(f"     - {key}: shape={arr.shape}, dtype={arr.dtype}")
+                                    if key == 'gender':
+                                        print(f"       value: {arr[0]}")
+                                    elif len(arr.shape) == 2 and arr.shape[0] <= 5:
+                                        print(f"       first frame: {arr[0]}")
+                                print(f"\n   Full motion data structure:")
+                                print(f"     - Total frames: {npz_data['trans'].shape[0]}")
+                                print(f"     - Duration: {npz_data['trans'].shape[0] / 30:.2f}s @ 30fps")
+
+                            print(f"{'='*60}\n")
 
                             # Now generate HTML from the saved data (let it use default output_dir)
                             print(f">>> Generating HTML visualization...")
@@ -476,7 +526,7 @@ def streaming_generate_motion(
                                 ></iframe>
                             """
                             print(f">>> Putting iframe HTML in queue (escaped size: {len(iframe_html)} bytes)")
-                            _frame_queue.put(iframe_html)
+                            _frame_queue.put((iframe_html, json_files))
                         except Exception as e:
                             print(f">>> HTML generation failed: {e}")
                             import traceback
@@ -525,14 +575,14 @@ def streaming_generate_motion(
                     <p>{str(e)}</p>
                 </div>
                 """
-                _frame_queue.put(error_html)
+                _frame_queue.put((error_html, []))
         
         # Start the generation thread
         thread = threading.Thread(target=generation_thread, daemon=True)
         thread.start()
         
         # Initial waiting message
-        yield f"""
+        yield (f"""
         <div style="text-align: center; padding: 40px;">
             <h3>🕒 Initializing motion generation...</h3>
             <p>Please wait while we set up the generation pipeline...</p>
@@ -540,7 +590,7 @@ def streaming_generate_motion(
                 <div style="font-family: monospace; font-size: 18px;">⏳</div>
             </div>
         </div>
-        """
+        """, [])
 
         # Yield updates from the queue
         last_update = None
@@ -548,16 +598,16 @@ def streaming_generate_motion(
         while True:
             if _stop_streaming.is_set():
                 print(">>> Streaming stopped")
-                yield "<div style='color: orange; text-align: center; padding: 20px;'>Generation stopped by user.</div>"
+                yield ("<div style='color: orange; text-align: center; padding: 20px;'>Generation stopped by user.</div>", [])
                 break
 
             try:
                 # Try to get an update with a timeout
-                html_update = _frame_queue.get(timeout=0.5)
+                html_update, files_list = _frame_queue.get(timeout=0.5)
                 last_update = html_update
                 update_count += 1
-                print(f">>> Yielding update #{update_count} to Gradio (length: {len(html_update)} chars)")
-                yield html_update
+                print(f">>> Yielding update #{update_count} to Gradio (length: {len(html_update)} chars, files: {len(files_list)})")
+                yield (html_update, files_list)
 
                 # If this was the final result, we're done
                 if "</iframe>" in html_update or "Generation Completed" in html_update:
@@ -572,13 +622,13 @@ def streaming_generate_motion(
                         break
                     else:
                         # Thread died without producing output
-                        yield "<div style='color: red; text-align: center; padding: 20px;'>Generation failed - thread ended without output</div>"
+                        yield ("<div style='color: red; text-align: center; padding: 20px;'>Generation failed - thread ended without output</div>", [])
                         break
                 # Continue waiting for updates
                 continue
             except Exception as e:
                 print(f">>> Error in streaming loop: {e}")
-                yield f"<div style='color: red; text-align: center; padding: 20px;'>Error: {str(e)}</div>"
+                yield (f"<div style='color: red; text-align: center; padding: 20px;'>Error: {str(e)}</div>", [])
                 break
 
         # Wait for thread to complete
@@ -658,6 +708,14 @@ class StreamingGradioApp:
                         info="Higher values follow the prompt more closely",
                     )
                     
+                    # Output format selection
+                    self.output_format = gr.Radio(
+                        choices=["json", "dict"],
+                        value="json",
+                        label="📁 Output Format",
+                        info="Choose the output format for generated motions",
+                    )
+                    
                     # Generation buttons
                     with gr.Row():
                         self.stop_btn = gr.Button(
@@ -677,6 +735,14 @@ class StreamingGradioApp:
                         label="📊 Status Information",
                         value="Enter your text and click [🚀 Generate Motion (Streaming)] to start frame-by-frame generation.",
                     )
+                    
+                    # Download section
+                    with gr.Row(visible=False) as self.download_row:
+                        self.download_files = gr.File(
+                            label="📦 Download Generated Files",
+                            file_count="multiple",
+                            interactive=False,
+                        )
                     
                     # Advanced settings
                     with gr.Accordion("🔧 Advanced Settings", open=False):
@@ -792,12 +858,16 @@ class StreamingGradioApp:
                 self.seed_input,
                 self.duration_slider,
                 self.cfg_slider,
-                gr.State("dict")  # output_format
+                self.output_format  # output_format
             ],
-            outputs=[self.output_display]
+            outputs=[self.output_display, self.download_files]
         ).then(
-            fn=lambda: "🎉 Streaming generation completed!",
-            outputs=[self.status_output]
+            fn=lambda html, files: (
+                "🎉 Streaming generation completed!" + (f" {len(files)} file(s) ready for download." if files else ""),
+                gr.update(visible=bool(files))
+            ),
+            inputs=[self.output_display, self.download_files],
+            outputs=[self.status_output, self.download_row]
         )
 
 

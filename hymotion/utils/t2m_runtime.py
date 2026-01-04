@@ -1,10 +1,12 @@
 # t2m_runtime.py
+import json
 import os
 import threading
 import time
 import uuid
 from typing import List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import yaml
 
@@ -75,21 +77,11 @@ class T2MRuntime:
         self._lock = threading.Lock()
         self._loaded = False
 
-        if self.disable_prompt_engineering:
-            self.prompt_rewriter = None
-        else:
-            self.prompt_rewriter = PromptRewriter(
-                host=self.prompt_engineering_host, model_path=self.prompt_engineering_model_path
-            )
-        # Skip model loading if checkpoint not found
-        if self.skip_model_loading:
-            print(">>> [WARNING] Checkpoint not found, will use randomly initialized model weights")
-        self.load()
+        # Initialize FBX availability before load()
         self.fbx_available = FBX_AVAILABLE
         if self.fbx_available:
             try:
                 from .smplh2woodfbx import SMPLH2WoodFBX
-
                 self.fbx_converter = SMPLH2WoodFBX()
             except Exception as e:
                 print(f">>> Failed to initialize FBX converter: {e}")
@@ -98,6 +90,19 @@ class T2MRuntime:
         else:
             self.fbx_converter = None
             print(">>> FBX module not found. FBX export will be disabled.")
+
+        if self.disable_prompt_engineering:
+            self.prompt_rewriter = None
+        else:
+            self.prompt_rewriter = PromptRewriter(
+                host=self.prompt_engineering_host,
+                model_path=self.prompt_engineering_model_path,
+                lazy_load=True  # Enable lazy loading for faster startup
+            )
+        # Skip model loading if checkpoint not found
+        if self.skip_model_loading:
+            print(">>> [WARNING] Checkpoint not found, will use randomly initialized model weights")
+        self.load()
 
         device_info = self.device_ids if self.device_ids else "cpu"
         if self.skip_model_loading:
@@ -159,15 +164,34 @@ class T2MRuntime:
     def load(self):
         if self._loaded:
             return
+        import time
+        
         print(f">>> Loading model from {self.config_path}...")
+        print(f">>> [DEBUG] Starting T2MRuntime loading process...")
+        
+        total_start = time.time()
 
+        # Step 1: Load config
+        print(f">>> [DEBUG] Step 1/4: Loading configuration file...")
+        config_start = time.time()
         with open(self.config_path, "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
+        config_time = time.time() - config_start
+        print(f">>> [DEBUG] Configuration loaded in {config_time:.2f} seconds")
 
         # Use allow_empty_ckpt=True when skip_model_loading is True
         allow_empty_ckpt = self.skip_model_loading
 
+        # Step 2: Create and load pipelines
+        print(f">>> [DEBUG] Step 2/4: Creating and loading pipelines...")
+        print(f">>> [DEBUG] Device IDs: {self.device_ids}")
+        print(f">>> [DEBUG] Skip text encoder: {self.skip_text}")
+        print(f">>> [DEBUG] Skip model loading: {self.skip_model_loading}")
+        
+        pipeline_start = time.time()
+        
         if not self.device_ids:
+            print(f">>> [DEBUG] Loading pipeline on CPU...")
             pipeline = load_object(
                 config["train_pipeline"],
                 config["train_pipeline_args"],
@@ -175,34 +199,74 @@ class T2MRuntime:
                 network_module_args=config["network_module_args"],
             )
             device = torch.device("cpu")
+            print(f">>> [DEBUG] Loading checkpoint from {self.ckpt_name}...")
             pipeline.load_in_demo(
                 self.ckpt_name,
                 os.path.dirname(self.ckpt_name),
                 build_text_encoder=not self.skip_text,
                 allow_empty_ckpt=allow_empty_ckpt,
             )
+            print(f">>> [DEBUG] Moving pipeline to CPU...")
             pipeline.to(device)
             self.pipelines = [pipeline]
             self._gpu_load = [0]
         else:
-            for gid in self.device_ids:
-                p = load_object(
-                    config["train_pipeline"],
-                    config["train_pipeline_args"],
-                    network_module=config["network_module"],
-                    network_module_args=config["network_module_args"],
-                )
-                p.load_in_demo(
-                    self.ckpt_name,
-                    os.path.dirname(self.ckpt_name),
-                    build_text_encoder=not self.skip_text,
-                    allow_empty_ckpt=allow_empty_ckpt,
-                )
-                p.to(torch.device(f"cuda:{gid}"))
-                self.pipelines.append(p)
-            self._gpu_load = [0] * len(self.pipelines)
+            print(f">>> [DEBUG] Loading pipeline on GPU {self.device_ids[0]}...")
+            print(f">>> [DEBUG] Note: HY-Motion model is large (~45GB) and will use GPU {self.device_ids[0]}")
+            print(f">>> [DEBUG] Prompter model will use GPU {self.device_ids[1] if len(self.device_ids) > 1 else self.device_ids[0]}")
+            p_start = time.time()
+            
+            # Load pipeline on the first GPU only (model is too large to split)
+            p = load_object(
+                config["train_pipeline"],
+                config["train_pipeline_args"],
+                network_module=config["network_module"],
+                network_module_args=config["network_module_args"],
+            )
+            print(f">>> [DEBUG] Loading checkpoint from {self.ckpt_name}...")
+            p.load_in_demo(
+                self.ckpt_name,
+                os.path.dirname(self.ckpt_name),
+                build_text_encoder=not self.skip_text,
+                allow_empty_ckpt=allow_empty_ckpt,
+            )
+            print(f">>> [DEBUG] Moving pipeline to cuda:{self.device_ids[0]}...")
+            p.to(torch.device(f"cuda:{self.device_ids[0]}"))
+            
+            self.pipelines = [p]
+            self._gpu_load = [0]
+            p_time = time.time() - p_start
+            print(f">>> [DEBUG] Pipeline loaded in {p_time:.2f} seconds on GPU {self.device_ids[0]}")
+        
+        pipeline_time = time.time() - pipeline_start
+        print(f">>> [DEBUG] All pipelines loaded in {pipeline_time:.2f} seconds")
 
+        # Step 3: Initialize FBX converter
+        print(f">>> [DEBUG] Step 3/4: Initializing FBX converter...")
+        fbx_start = time.time()
+        if self.fbx_available:
+            try:
+                from .smplh2woodfbx import SMPLH2WoodFBX
+                self.fbx_converter = SMPLH2WoodFBX()
+                print(f">>> [DEBUG] FBX converter initialized successfully")
+            except Exception as e:
+                print(f">>> [DEBUG] Failed to initialize FBX converter: {e}")
+                self.fbx_available = False
+                self.fbx_converter = None
+        else:
+            self.fbx_converter = None
+            print(">>> FBX module not found. FBX export will be disabled.")
+        fbx_time = time.time() - fbx_start
+        print(f">>> [DEBUG] FBX converter initialization completed in {fbx_time:.2f} seconds")
+
+        # Step 4: Finalize
+        print(f">>> [DEBUG] Step 4/4: Finalizing runtime initialization...")
         self._loaded = True
+        
+        total_time = time.time() - total_start
+        print(f">>> [DEBUG] Total T2MRuntime loading time: {total_time:.2f} seconds")
+        print(f">>> [DEBUG] Number of pipelines: {len(self.pipelines)}")
+        print(f">>> [DEBUG] T2MRuntime loading completed successfully!")
 
     def _acquire_pipeline(self) -> int:
         while True:
@@ -392,6 +456,22 @@ class T2MRuntime:
                 fbx_filename=output_filename,
             )
             return html_content, fbx_files, model_output
+        elif output_format == "npy":
+            # Export raw SMPL-H data as .npy files
+            npy_files = self._generate_npy_files(
+                visualization_data=save_data,
+                output_dir=output_dir,
+                npy_filename=output_filename,
+            )
+            return html_content, npy_files, model_output
+        elif output_format == "json":
+            # Export SMPL-H data as .json files
+            json_files = self._generate_json_files(
+                visualization_data=save_data,
+                output_dir=output_dir,
+                json_filename=output_filename,
+            )
+            return html_content, json_files, model_output
         elif output_format == "dict":
             # Return HTML content and empty list for fbx_files when using dict format
             return html_content, [], model_output
@@ -472,3 +552,151 @@ class T2MRuntime:
                 fbx_files.append(txt_path)
 
         return fbx_files
+
+    def _generate_npy_files(
+        self,
+        visualization_data: dict,
+        output_dir: Optional[str] = None,
+        npy_filename: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Generate .npy files containing raw SMPL-H data for each animation.
+        
+        Args:
+            visualization_data: Dictionary containing SMPL data and metadata
+            output_dir: Directory to save .npy files
+            npy_filename: Base filename for the .npy files
+            
+        Returns:
+            List of paths to generated .npy files
+        """
+        assert "smpl_data" in visualization_data, "smpl_data not found in visualization_data"
+        npy_files = []
+        
+        if output_dir is None:
+            root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            output_dir = os.path.join(root_dir, "output", "gradio")
+
+        smpl_data_list = visualization_data["smpl_data"]
+        text = visualization_data["text"]
+        timestamp = visualization_data["timestamp"]
+        
+        for bb in range(len(smpl_data_list)):
+            smpl_data = smpl_data_list[bb]
+            
+            if npy_filename is None:
+                npy_filename_bb = f"{timestamp}_{bb:03d}_smplh.npy"
+            else:
+                npy_filename_bb = f"{npy_filename}_{bb:03d}_smplh.npy"
+            
+            npy_path = os.path.join(output_dir, npy_filename_bb)
+            
+            # Prepare SMPL-H data dictionary
+            smplh_dict = {
+                'poses': smpl_data['poses'],  # (num_frames, 156) - axis-angle rotations
+                'trans': smpl_data['trans'],  # (num_frames, 3) - translations
+                'betas': smpl_data['betas'],  # (1, 16) - shape parameters
+                'gender': smpl_data['gender'],  # str - gender
+                'Rh': smpl_data['Rh'],  # (num_frames, 3) - root rotation
+                'mocap_framerate': smpl_data.get('mocap_framerate', 30),
+                'num_frames': smpl_data.get('num_frames', smpl_data['poses'].shape[0]),
+            }
+            
+            # Save as .npy file
+            np.save(npy_path, smplh_dict)
+            npy_files.append(npy_path)
+            print(f"\t>>> NPY file generated: {npy_path}")
+            
+            # Also save a text file with the prompt
+            txt_path = npy_path.replace("_smplh.npy", "_prompt.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            npy_files.append(txt_path)
+        
+        return npy_files
+    
+    def _generate_json_files(
+        self,
+        visualization_data: dict,
+        output_dir: Optional[str] = None,
+        json_filename: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Generate .json files from SMPL-H data for each animation.
+        
+        Args:
+            visualization_data: Dictionary containing SMPL data and metadata
+            output_dir: Directory to save .json files
+            json_filename: Base filename for the .json files
+            
+        Returns:
+            List of paths to generated .json files
+        """
+        assert "smpl_data" in visualization_data, "smpl_data not found in visualization_data"
+        json_files = []
+        
+        if output_dir is None:
+            root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            output_dir = os.path.join(root_dir, "output", "gradio")
+
+        smpl_data_list = visualization_data["smpl_data"]
+        text = visualization_data["text"]
+        timestamp = visualization_data["timestamp"]
+        
+        for bb in range(len(smpl_data_list)):
+            smpl_data = smpl_data_list[bb]
+            
+            if json_filename is None:
+                # Use text as filename, replace spaces with underscores
+                json_filename_bb = f"{timestamp}_{bb:03d}_{text.replace(' ', '_')}.json"
+                # Remove any problematic characters for filenames
+                json_filename_bb = "".join(c for c in json_filename_bb if c.isalnum() or c in '_-')
+            else:
+                json_filename_bb = f"{json_filename}_{bb:03d}.json"
+            
+            json_path = os.path.abspath(os.path.join(output_dir, json_filename_bb))
+            
+            # Initialize export dictionary
+            export_dict = {}
+            
+            # 1. Handle Poses (The rotations)
+            if 'poses' in smpl_data:
+                p = smpl_data['poses'].astype(np.float32)
+                export_dict["frameCount"] = int(p.shape[0])
+                export_dict["poses"] = p.flatten().tolist()
+                print(f"\t>>> Added 'poses': {p.shape}")
+            
+            # 2. Handle Translation (The movement)
+            if 'trans' in smpl_data:
+                t = smpl_data['trans'].astype(np.float32)
+                export_dict["trans"] = t.flatten().tolist()
+                print(f"\t>>> Added 'trans': {t.shape}")
+            
+            # 3. Handle Root Rotation (Rh)
+            if 'Rh' in smpl_data:
+                r = smpl_data['Rh'].astype(np.float32)
+                export_dict["Rh"] = r.flatten().tolist()
+                print(f"\t>>> Added 'Rh': {r.shape}")
+            
+            # 4. Add metadata
+            export_dict["text"] = text
+            export_dict["timestamp"] = timestamp
+            export_dict["batch_index"] = bb
+            
+            # Write to JSON with indentation
+            with open(json_path, 'w') as f:
+                json.dump(export_dict, f, indent=4)
+            
+            json_files.append(json_path)
+            print(f"\t>>> JSON file generated: {json_path}")
+            print(f"\t>>> JSON file exists: {os.path.exists(json_path)}")
+            print(f"\t>>> JSON file size: {os.path.getsize(json_path)} bytes")
+            
+            # Also save a text file with the prompt
+            txt_path = os.path.abspath(json_path.replace(".json", "_prompt.txt"))
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            json_files.append(txt_path)
+            print(f"\t>>> Prompt file generated: {txt_path}")
+        
+        return json_files

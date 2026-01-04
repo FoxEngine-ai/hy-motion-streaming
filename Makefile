@@ -14,7 +14,7 @@
 #   make docker-build          - Build Docker image
 #   make docker-run            - Run Docker container
 
-.PHONY: help setup install download-models download-t2m download-encoders download-rewriter run-cli run-gradio clean docker-build docker-run
+.PHONY: help setup install download-models download-t2m download-encoders download-rewriter run-cli run-gradio clean docker-build docker-run quantize-prompter
 
 # Default target
 all: help
@@ -35,6 +35,9 @@ help:
 	@echo "  make download-t2m          - Download text-to-motion models"
 	@echo "  make download-encoders     - Download text encoder models"
 	@echo "  make download-rewriter     - Download prompt rewriter model"
+	@echo ""
+	@echo "Model Optimization:"
+	@echo "  make quantize-prompter     - Quantize prompter model to 4-bit (faster loading)"
 	@echo ""
 	@echo "Running the Application:"
 	@echo "  make run-cli               - Run CLI inference (default: HY-Motion-1.0)"
@@ -88,6 +91,14 @@ download-rewriter:
 	mkdir -p ckpts
 	huggingface-cli download Text2MotionPrompter/Text2MotionPrompter --local-dir ckpts/Text2MotionPrompter || echo "Failed to download prompt rewriter"
 
+# Quantize prompter model to 4-bit for faster loading
+quantize-prompter:
+	@echo "Quantizing prompter model to 4-bit..."
+	@echo "This will create a quantized version at ckpts/Text2MotionPrompter_4bit"
+	@echo "This process may take several minutes but only needs to be done once."
+	@echo ""
+	python3 scripts/quantize_prompter_model.py
+
 # Run CLI inference
 run-cli:
 	@echo "Running CLI inference with HY-Motion-1.0..."
@@ -109,7 +120,7 @@ run-gradio-streaming:
 	USE_HF_MODELS=0 python3 gradio_app_streaming.py
 
 # Run Streaming Gradio web interface with Docker
-run-gradio-streaming-docker:
+run-gradio-docker:
 	@echo "Running Streaming Gradio web interface with Docker..."
 	mkdir -p $(PWD)/output/gradio
 	docker run -it --rm \
@@ -117,10 +128,25 @@ run-gradio-streaming-docker:
 	    -p 7860:7860 -p 7861:7861 \
 	    -v $(PWD):/app \
 	    -v $(PWD)/ckpts:/app/ckpts \
-	    -v $(PWD)/downloaded_models:/app/downloaded_models \
 	    -v $(PWD)/output:/app/output \
 	    -e USE_HF_MODELS=0 \
 	    -e PYTHONPATH=/app \
+	    -e PROMPT_MODEL_PATH=/app/ckpts/Text2MotionPrompter \
+	    hymotion:latest python gradio_app.py
+
+
+ run-gradio-streaming-docker:
+	@echo "Running Streaming Gradio web interface with Docker..."
+	mkdir -p $(PWD)/output/gradio
+	docker run -it --rm \
+	    --gpus all \
+	    -p 7860:7860 -p 7861:7861 \
+	    -v $(PWD):/app \
+	    -v $(PWD)/ckpts:/app/ckpts \
+	    -v $(PWD)/output:/app/output \
+	    -e USE_HF_MODELS=0 \
+	    -e PYTHONPATH=/app \
+	    -e PROMPT_MODEL_PATH=/app/ckpts/Text2MotionPrompter \
 	    hymotion:latest python gradio_app_streaming.py
 
 # Download and setup streaming-specific models

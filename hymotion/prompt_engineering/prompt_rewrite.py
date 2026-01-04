@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -245,11 +246,13 @@ class ResponseParser:
 
 class PromptRewriter:
     def __init__(
-        self, host: Optional[str] = None, model_path: Optional[str] = None, parser: Optional[ResponseParser] = None
+        self, host: Optional[str] = None, model_path: Optional[str] = None, parser: Optional[ResponseParser] = None, lazy_load: bool = True
     ):
         self.parser = parser or ResponseParser()
         self.logger = logging.getLogger(__name__)
         self.host = host
+        self.lazy_load = lazy_load
+        
         if host:
             self.api = OpenAIChatApi(
                 ApiConfig(
@@ -261,22 +264,132 @@ class PromptRewriter:
                 )
             )
         else:
-            self.model_path = model_path or "Text2MotionPrompter/Text2MotionPrompter"
+            # Check for pre-quantized model first
+            default_model_path = model_path or "Text2MotionPrompter/Text2MotionPrompter"
+            quantized_model_path = default_model_path + "_4bit"
+            
+            # Use quantized model if it exists
+            if os.path.exists(quantized_model_path):
+                print(f">>> [INFO] Found pre-quantized model at: {quantized_model_path}")
+                print(f">>> [INFO] Using quantized model for faster loading...")
+                self.model_path = quantized_model_path
+            else:
+                print(f">>> [INFO] No pre-quantized model found at: {quantized_model_path}")
+                print(f">>> [INFO] Using original model at: {default_model_path}")
+                print(f">>> [INFO] To create a quantized model, run: python scripts/quantize_prompter_model.py")
+                self.model_path = default_model_path
+            
             self.tokenizer = None
             self.model = None
-            self._load_model()
+            
+            # Only load model immediately if lazy_load is False
+            if not lazy_load:
+                self._load_model()
+            else:
+                print(f">>> [INFO] Lazy loading enabled - model will be loaded on first use")
 
     def _load_model(self):
         if self.model is None:
+            import time
             print(f">>> Loading prompter model from {self.model_path}")
+            print(f">>> [DEBUG] Starting model loading process...")
+            
+            start_time = time.time()
+            
+            # Step 1: Load tokenizer
+            print(f">>> [DEBUG] Step 1/3: Loading tokenizer...")
+            tokenizer_start = time.time()
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                load_in_4bit=True,
-            )
+            tokenizer_time = time.time() - tokenizer_start
+            print(f">>> [DEBUG] Tokenizer loaded in {tokenizer_time:.2f} seconds")
+            
+            # Step 2: Load model
+            print(f">>> [DEBUG] Step 2/3: Loading model...")
+            
+            # Check if this is a pre-quantized model
+            is_quantized = "_4bit" in self.model_path or "_8bit" in self.model_path
+            
+            # Determine target device and check available memory
+            if torch.cuda.is_available():
+                num_gpus = torch.cuda.device_count()
+                
+                # Use GPU 1 if available (GPU 0 is used by HY-Motion), otherwise use GPU 0
+                if num_gpus > 1:
+                    target_gpu = 1
+                    print(f">>> [DEBUG] Multiple GPUs detected ({num_gpus}). Using GPU {target_gpu} for prompter model.")
+                else:
+                    target_gpu = 0
+                    print(f">>> [DEBUG] Single GPU detected. Using GPU {target_gpu} for prompter model.")
+                
+                # Check available GPU memory on target GPU
+                total_memory = torch.cuda.get_device_properties(target_gpu).total_memory / 1024**3
+                allocated_memory = torch.cuda.memory_allocated(target_gpu) / 1024**3
+                free_memory = total_memory - allocated_memory
+                
+                print(f">>> [DEBUG] GPU {target_gpu} Memory: {total_memory:.2f} GB total, {allocated_memory:.2f} GB allocated, {free_memory:.2f} GB free")
+                
+                # If less than 10 GB free, use CPU offloading
+                if free_memory < 10:
+                    print(f">>> [WARNING] Low GPU memory ({free_memory:.2f} GB free). Using CPU offloading for prompter model.")
+                    target_device = "cpu"
+                    device_map = {"": "cpu"}
+                else:
+                    target_device = f"cuda:{target_gpu}"
+                    print(f">>> [DEBUG] Target device: {target_device}")
+                    # Use explicit device map to skip slow auto-detection
+                    device_map = {"": target_device}
+            else:
+                target_device = "cpu"
+                print(f">>> [DEBUG] Target device: {target_device} (no CUDA available)")
+                device_map = {"": target_device}
+            
+            if is_quantized:
+                print(f">>> [DEBUG] Loading pre-quantized model (no on-the-fly quantization needed)...")
+                print(f">>> [DEBUG] Model config: torch_dtype=float16, device_map={device_map}")
+                if target_device == "cpu":
+                    print(f">>> [INFO] Loading on CPU (slower but saves GPU memory)...")
+                    print(f">>> [DEBUG] Loading checkpoint shards (this may take 1-2 minutes on CPU)...")
+                else:
+                    print(f">>> [DEBUG] Loading checkpoint shards (this may take 30-60 seconds)...")
+                model_start = time.time()
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path,
+                    torch_dtype=torch.float16,
+                    device_map=device_map,
+                    low_cpu_mem_usage=True,
+                )
+            else:
+                print(f">>> [DEBUG] Loading model with 4-bit quantization...")
+                print(f">>> [DEBUG] Model config: torch_dtype=float16, device_map={device_map}, load_in_4bit=True")
+                if target_device == "cpu":
+                    print(f">>> [INFO] Loading on CPU (slower but saves GPU memory)...")
+                    print(f">>> [DEBUG] Loading checkpoint shards (this may take 1-2 minutes on CPU)...")
+                else:
+                    print(f">>> [DEBUG] Loading checkpoint shards (this may take 30-60 seconds)...")
+                model_start = time.time()
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path,
+                    torch_dtype=torch.float16,
+                    device_map=device_map,
+                    load_in_4bit=True,
+                    low_cpu_mem_usage=True,
+                )
+            
+            model_time = time.time() - model_start
+            print(f">>> [DEBUG] Model loaded in {model_time:.2f} seconds")
+            
+            # Step 3: Set to eval mode
+            print(f">>> [DEBUG] Step 3/3: Setting model to eval mode...")
+            eval_start = time.time()
             self.model.eval()
+            eval_time = time.time() - eval_start
+            print(f">>> [DEBUG] Model set to eval mode in {eval_time:.2f} seconds")
+            
+            total_time = time.time() - start_time
+            print(f">>> [DEBUG] Total model loading time: {total_time:.2f} seconds")
+            print(f">>> [DEBUG] Model device: {next(self.model.parameters()).device}")
+            print(f">>> [DEBUG] Model dtype: {next(self.model.parameters()).dtype}")
+            print(f">>> [DEBUG] Prompter model loading completed successfully!")
 
     def rewrite_prompt_and_infer_time(
         self,
@@ -297,6 +410,11 @@ class PromptRewriter:
                 self.logger.error(f"Prompt rewriting failed: {e}")
                 raise
         else:
+            # Lazy load model if not already loaded
+            if self.model is None:
+                print(f">>> [INFO] Loading prompter model on first use...")
+                self._load_model()
+            
             messages = [{"role": "user", "content": prompt_format.format(text)}]
             full_prompt = self.tokenizer.apply_chat_template(
                 messages,

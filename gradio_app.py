@@ -1,5 +1,6 @@
 import argparse
 import codecs as cs
+import gc
 import json
 import os
 import os.path as osp
@@ -46,7 +47,8 @@ except ImportError:
 
 from hymotion.utils.t2m_runtime import T2MRuntime
 
-NUM_WORKERS = torch.cuda.device_count() if torch.cuda.is_available() else 1
+# Use single worker for Gradio UI (HY-Motion on GPU 0, prompter on GPU 1)
+NUM_WORKERS = 1 if torch.cuda.is_available() else 1
 
 # Global runtime instance for Zero GPU lazy loading
 _global_runtime = None
@@ -115,6 +117,11 @@ def generate_motion_on_gpu(
         original_text=original_text,
         output_dir=output_dir,
     )
+    
+    # Clean up VRAM after generation
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     return html_content, fbx_files
 
 
@@ -486,6 +493,7 @@ class T2MGradioUI:
         seed_input: str,
         duration: float,
         cfg_scale: float,
+        output_format: str = "fbx",
     ) -> Tuple[str, List[str]]:
         # When rewrite is not available, use original_text directly
         if not self.prompt_engineering_available:
@@ -501,7 +509,13 @@ class T2MGradioUI:
             # Use runtime from global if available (for Zero GPU), otherwise use self.runtime
             runtime = _global_runtime if _global_runtime is not None else self.runtime
             fbx_ok = getattr(runtime, "fbx_available", False)
-            req_format = "fbx" if fbx_ok else "dict"
+            
+            # Determine output format based on selection and availability
+            if output_format == "fbx" and not fbx_ok:
+                print(">>> Warning: FBX format requested but FBX SDK not available. Falling back to dict format.")
+                req_format = "dict"
+            else:
+                req_format = output_format
 
             # Use GPU-decorated function for Zero GPU support
             html_content, fbx_files = generate_motion_on_gpu(
@@ -513,6 +527,11 @@ class T2MGradioUI:
                 original_text=original_text,
                 output_dir=self.args.output_dir,
             )
+            
+            # Debug: Print file list
+            print(f">>> [DEBUG] Generated files ({req_format}): {fbx_files}")
+            print(f">>> [DEBUG] Number of files: {len(fbx_files)}")
+            print(f">>> [DEBUG] Files exist: {[os.path.exists(f) for f in fbx_files]}")
             # Escape HTML content for srcdoc attribute
             escaped_html = html_content.replace('"', "&quot;")
             # Return iframe with srcdoc - directly embed HTML content
@@ -621,6 +640,14 @@ class T2MGradioUI:
                     # Advanced settings
                     with gr.Accordion("🔧 Advanced Settings", open=False):
                         self._build_advanced_settings()
+                    
+                    # Output format selection
+                    self.output_format = gr.Radio(
+                        choices=["fbx", "npy", "json", "dict"],
+                        value="fbx",
+                        label="📁 Output Format",
+                        info="Choose the output format for generated motions",
+                    )
 
                     # Example selection dropdown
                     self.example_dropdown = gr.Dropdown(
@@ -642,16 +669,18 @@ class T2MGradioUI:
                         value=status_msg,
                     )
 
-                    # FBX Download section
+                    # Download section
                     with gr.Row(visible=False) as self.fbx_download_row:
-                        if getattr(self.runtime, "fbx_available", False):
-                            self.fbx_files = gr.File(
-                                label="📦 Download FBX Files",
-                                file_count="multiple",
-                                interactive=False,
-                            )
-                        else:
-                            self.fbx_files = gr.State([])
+                        self.fbx_files = gr.File(
+                            label="📦 Download Generated Files",
+                            file_count="multiple",
+                            interactive=False,
+                        )
+                        self.output_files_label = gr.Textbox(
+                            label="📁 Output Format",
+                            value="fbx",
+                            visible=False,
+                        )
 
                 # Right display area
                 with gr.Column(scale=3):
@@ -773,20 +802,22 @@ class T2MGradioUI:
                 self.seed_input,
                 self.duration_slider,
                 self.cfg_slider,
+                self.output_format,
             ],
             outputs=[self.output_display, self.fbx_files],
             concurrency_limit=NUM_WORKERS,
         ).then(
-            fn=lambda fbx_list: (
+            fn=lambda fbx_list, fmt: (
                 (
-                    "🎉 Motion generation completed! You can view the motion visualization result on the right. FBX files are ready for download."
+                    f"🎉 Motion generation completed! You can view the motion visualization result on the right. {fmt.upper()} files are ready for download."
                     if fbx_list
                     else "🎉 Motion generation completed! You can view the motion visualization result on the right"
                 ),
                 gr.update(visible=bool(fbx_list)),
+                gr.update(value=fmt),
             ),
-            inputs=[self.fbx_files],
-            outputs=[self.status_output, self.fbx_download_row],
+            inputs=[self.fbx_files, self.output_format],
+            outputs=[self.status_output, self.fbx_download_row, self.output_files_label],
         )
 
         # Reset logic - different behavior based on rewrite availability
@@ -864,42 +895,88 @@ def create_demo(final_model_path):
             def __init__(self):
                 self.fbx_available = False
                 self.prompt_engineering_host = args.prompt_engineering_host
+                self.prompt_engineering_model_path = args.prompt_engineering_model_path
+                self._prompt_rewriter = None  # Cache the rewriter instance
 
             def rewrite_text_and_infer_time(self, text: str):
                 # For prompt rewriting, we don't need GPU
                 from hymotion.prompt_engineering.prompt_rewrite import PromptRewriter
 
-                rewriter = PromptRewriter(
-                    host=self.prompt_engineering_host, model_path=self.prompt_engineering_model_path
-                )
-                return rewriter.rewrite_prompt_and_infer_time(text)
+                # Cache the PromptRewriter instance to avoid reloading the model
+                if self._prompt_rewriter is None:
+                    print(">>> Creating prompter rewriter (lazy loading enabled)...")
+                    self._prompt_rewriter = PromptRewriter(
+                        host=self.prompt_engineering_host,
+                        model_path=self.prompt_engineering_model_path,
+                        lazy_load=True  # Model will load on first use
+                    )
+                    print(">>> Prompter rewriter created (model will load on first rewrite)...")
+                
+                return self._prompt_rewriter.rewrite_prompt_and_infer_time(text)
 
         runtime = PlaceholderRuntime()
     else:
         # Local development: load model immediately
-        print(">>> Local environment detected. Loading model at startup.")
-        skip_model_loading = False
-        if not os.path.exists(ckpt):
-            print(f">>> [WARNING] Checkpoint file not found: {ckpt}")
-            print(f">>> [WARNING] Model loading will be skipped. Motion generation will not be available.")
-            skip_model_loading = True
-
-        print(">>> Initializing T2MRuntime...")
-        if "USE_HF_MODELS" not in os.environ:
-            os.environ["USE_HF_MODELS"] = "1"
-
-        skip_text = False
-        runtime = T2MRuntime(
-            config_path=cfg,
-            ckpt_name=ckpt,
-            skip_text=skip_text,
-            device_ids=None,
-            skip_model_loading=skip_model_loading,
-            disable_prompt_engineering=args.disable_prompt_engineering,
-            prompt_engineering_host=args.prompt_engineering_host,
-            prompt_engineering_model_path=args.prompt_engineering_model_path,
-        )
-        _global_runtime = runtime  # Set global runtime for GPU function
+            import time
+            print(">>> Local environment detected. Loading model at startup.")
+            print(">>> [DEBUG] Starting Gradio app initialization...")
+            
+            startup_start = time.time()
+            
+            skip_model_loading = False
+            if not os.path.exists(ckpt):
+                print(f">>> [WARNING] Checkpoint file not found: {ckpt}")
+                print(f">>> [WARNING] Model loading will be skipped. Motion generation will not be available.")
+                skip_model_loading = True
+    
+            print(">>> Initializing T2MRuntime...")
+            if "USE_HF_MODELS" not in os.environ:
+                os.environ["USE_HF_MODELS"] = "1"
+    
+            skip_text = False
+            
+            # Use GPU 0 for HY-Motion model, GPU 1 for prompter model (if available)
+            if torch.cuda.is_available():
+                num_gpus = torch.cuda.device_count()
+                device_ids = [0]  # HY-Motion uses GPU 0
+                if num_gpus > 1:
+                    print(f">>> Using GPU 0 for HY-Motion model (~45GB)")
+                    print(f">>> Using GPU 1 for prompter model (~5GB)")
+                else:
+                    print(f">>> Using GPU 0 for both HY-Motion and prompter models")
+            else:
+                device_ids = []
+                print(">>> No CUDA devices available, using CPU")
+            
+            runtime_start = time.time()
+            runtime = T2MRuntime(
+                config_path=cfg,
+                ckpt_name=ckpt,
+                skip_text=skip_text,
+                device_ids=device_ids,  # Use all available GPUs
+                skip_model_loading=skip_model_loading,
+                disable_prompt_engineering=args.disable_prompt_engineering,
+                prompt_engineering_host=args.prompt_engineering_host,
+                prompt_engineering_model_path=args.prompt_engineering_model_path,
+            )
+            runtime_time = time.time() - runtime_start
+            print(f">>> [DEBUG] T2MRuntime initialized in {runtime_time:.2f} seconds")
+            
+            _global_runtime = runtime  # Set global runtime for GPU function
+            print(f">>> Runtime initialized on {len(device_ids)} GPU(s)")
+            
+            ui_start = time.time()
+            ui = T2MGradioUI(runtime=runtime, args=args)
+            ui_time = time.time() - ui_start
+            print(f">>> [DEBUG] Gradio UI initialized in {ui_time:.2f} seconds")
+            
+            demo = ui.build_ui()
+            demo_time = time.time() - ui_start
+            print(f">>> [DEBUG] Demo built in {demo_time:.2f} seconds")
+            
+            total_startup_time = time.time() - startup_start
+            print(f">>> [DEBUG] Total Gradio app startup time: {total_startup_time:.2f} seconds")
+            print(f">>> [DEBUG] Gradio app initialization completed successfully!")
 
     ui = T2MGradioUI(runtime=runtime, args=args)
     demo = ui.build_ui()
@@ -907,7 +984,25 @@ def create_demo(final_model_path):
 
 
 if __name__ == "__main__":
-    # Create demo at module level for Hugging Face Spaces
-    final_model_path = try_to_download_model()
+    # Check for local models first before downloading
+    local_model_paths = [
+        "ckpts/tencent/HY-Motion-1.0/HY-Motion-1.0",
+        "ckpts/tencent/HY-Motion-1.0/HY-Motion-1.0-Lite",
+    ]
+
+    final_model_path = None
+    for model_path in local_model_paths:
+        cfg = os.path.join(model_path, "config.yml")
+        ckpt = os.path.join(model_path, "latest.ckpt")
+        if os.path.exists(cfg) and os.path.exists(ckpt):
+            final_model_path = model_path
+            print(f">>> [INFO] Using local model: {model_path}")
+            break
+
+    # Only download if no local model found
+    if final_model_path is None:
+        print(">>> [INFO] No local models found, downloading from Hugging Face...")
+        final_model_path = try_to_download_model()
+
     demo = create_demo(final_model_path)
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", server_port=7860)
