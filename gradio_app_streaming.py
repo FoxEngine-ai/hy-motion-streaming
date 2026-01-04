@@ -346,6 +346,8 @@ def streaming_generate_motion(
     output_format: str,
     original_text: Optional[str] = None,
     output_dir: Optional[str] = None,
+    continue_from_json: Optional[str] = None,
+    continue_mode: bool = False,
 ) -> Generator[Tuple[str, List[str]], None, None]:
     """
     Streaming version of motion generation that yields HTML updates and file lists.
@@ -358,11 +360,44 @@ def streaming_generate_motion(
         output_format: Output format (json or dict)
         original_text: Original text (before rewriting)
         output_dir: Output directory
+        continue_from_json: Path to JSON file to continue from (optional)
+        continue_mode: Whether to enable continuation mode
         
     Yields:
         Tuple of (HTML content updates, list of file paths) for Gradio streaming
     """
     runtime = _init_runtime_if_needed()
+    
+    # Parse continuation JSON if provided
+    starting_motion = None
+    if continue_mode and continue_from_json:
+        try:
+            print(f">>> [CONTINUATION] Loading starting motion from: {continue_from_json}")
+            with open(continue_from_json, 'r') as f:
+                json_data = json.load(f)
+            
+            # Extract motion data from JSON
+            frame_count = json_data['frameCount']
+            poses = np.array(json_data['poses']).reshape(frame_count, 156)
+            trans = np.array(json_data['trans']).reshape(frame_count, 3)
+            
+            # Get all frames (not just the last one) for concatenation
+            starting_motion = {
+                'poses': poses,  # All frames
+                'trans': trans,  # All frames
+                'frame_count': frame_count,
+                'text': json_data.get('text', ''),
+            }
+            
+            print(f">>> [CONTINUATION] Loaded {frame_count} frames from JSON")
+            print(f">>> [CONTINUATION] Using all frames for concatenation")
+            print(f">>> [CONTINUATION] Original text: {json_data.get('text', 'N/A')}")
+        except Exception as e:
+            print(f">>> [CONTINUATION] Error loading JSON: {e}")
+            import traceback
+            traceback.print_exc()
+            yield (f"<div style='color: red; text-align: center; padding: 20px;'>❌ Error loading continuation JSON: {str(e)}</div>", [])
+            return
     
     # Clear any previous frames
     while not _frame_queue.empty():
@@ -441,12 +476,159 @@ def streaming_generate_motion(
                                     else:
                                         print(f">>>   {key}: type={type(val)}")
 
+                            # Handle continuation mode: concatenate original motion with new motion
+                            if continue_mode and starting_motion is not None:
+                                print(f">>> [CONTINUATION] Concatenating original motion with new motion...")
+                                
+                                # Extract new motion data (using correct field names)
+                                new_rot6d = motion_data['rot6d']  # Shape: (1, new_frames, 22, 6)
+                                new_transl = motion_data['transl']  # Shape: (1, new_frames, 3)
+                                
+                                # Get original motion data from JSON
+                                # The JSON has poses (156 values = 52 joints × 3 axis-angle)
+                                # We need to extract the first 22 joints and convert to rot6d format
+                                orig_poses = starting_motion['poses']  # Shape: (orig_frames, 156)
+                                orig_trans = starting_motion['trans']  # Shape: (orig_frames, 3)
+                                
+                                print(f">>> [CONTINUATION] orig_poses shape: {orig_poses.shape}, orig_trans shape: {orig_trans.shape}")
+                                
+                                # Reshape poses to (orig_frames, 52, 3) - axis-angle format
+                                orig_poses_aa = orig_poses.reshape(-1, 52, 3)
+                                
+                                # Extract only the first 22 joints (the body joints, excluding hands)
+                                orig_poses_aa_body = orig_poses_aa[:, :22, :]  # (orig_frames, 22, 3)
+                                
+                                print(f">>> [CONTINUATION] orig_poses_aa_body shape: {orig_poses_aa_body.shape}")
+                                
+                                # Convert axis-angle to rotation matrix, then to rot6d
+                                from hymotion.utils.geometry import rotation_matrix_to_rot6d
+                                from hymotion.pipeline.body_model import batch_rodrigues
+                                
+                                # Convert axis-angle to rotation matrices
+                                orig_rot_mats = batch_rodrigues(
+                                    torch.from_numpy(orig_poses_aa_body.reshape(-1, 3)).float()
+                                )  # (orig_frames * 22, 3, 3)
+                                
+                                print(f">>> [CONTINUATION] orig_rot_mats shape after batch_rodrigues: {orig_rot_mats.shape}")
+                                
+                                # Reshape back to (orig_frames, 22, 3, 3)
+                                num_orig_frames = orig_poses_aa_body.shape[0]
+                                orig_rot_mats = orig_rot_mats.reshape(num_orig_frames, 22, 3, 3)
+                                
+                                print(f">>> [CONTINUATION] orig_rot_mats shape after reshape: {orig_rot_mats.shape}")
+                                
+                                # Convert rotation matrices to rot6d
+                                orig_rot6d = rotation_matrix_to_rot6d(orig_rot_mats)  # (orig_frames, 22, 6)
+                                
+                                print(f">>> [CONTINUATION] orig_rot6d shape: {orig_rot6d.shape}")
+                                
+                                # Add batch dimension using torch.unsqueeze (not np.newaxis which doesn't work on tensors)
+                                orig_rot6d = orig_rot6d.unsqueeze(0)  # (1, orig_frames, 22, 6)
+                                orig_transl = torch.from_numpy(orig_trans).unsqueeze(0).float()  # (1, orig_frames, 3)
+                                
+                                print(f">>> [CONTINUATION] After unsqueeze - orig_rot6d: {orig_rot6d.shape}, orig_transl: {orig_transl.shape}")
+                                print(f">>> [CONTINUATION] new_rot6d: {new_rot6d.shape}, new_transl: {new_transl.shape}")
+                                
+                                # Move tensors to same device
+                                device = new_rot6d.device
+                                orig_rot6d = orig_rot6d.to(device)
+                                orig_transl = orig_transl.to(device)
+                                
+                                # Concatenate along frame dimension (axis=1)
+                                combined_rot6d = torch.cat([orig_rot6d, new_rot6d], dim=1)  # (1, total_frames, 22, 6)
+                                print(f">>> [CONTINUATION] Before blending - orig_rot6d: {orig_rot6d.shape}, new_rot6d: {new_rot6d.shape}")
+                                
+                                # ====== SMOOTH POSE BLENDING ======
+                                # Blend poses over a transition window to avoid jarring pose changes
+                                blend_frames = min(15, orig_rot6d.shape[1] // 2, new_rot6d.shape[1] // 2)  # 15 frames = 0.5s at 30fps
+                                
+                                if blend_frames > 0:
+                                    print(f">>> [CONTINUATION] Applying pose blending over {blend_frames} frames...")
+                                    
+                                    # Get the last pose of original motion (to blend FROM)
+                                    orig_last_rot6d = orig_rot6d[:, -1:, :, :]  # (1, 1, 22, 6)
+                                    
+                                    # Create blending weights: 0 at start (use orig pose), 1 at end (use new pose)
+                                    blend_weights = torch.linspace(0, 1, blend_frames, device=device).view(1, blend_frames, 1, 1)
+                                    
+                                    # Blend the first N frames of new motion with the last pose of original
+                                    new_rot6d_start = new_rot6d[:, :blend_frames, :, :]  # (1, blend_frames, 22, 6)
+                                    
+                                    # Linear interpolation: blended = orig * (1 - w) + new * w
+                                    blended_rot6d = orig_last_rot6d * (1 - blend_weights) + new_rot6d_start * blend_weights
+                                    
+                                    # Replace the first blend_frames of new_rot6d with the blended version
+                                    new_rot6d_blended = torch.cat([blended_rot6d, new_rot6d[:, blend_frames:, :, :]], dim=1)
+                                    
+                                    print(f">>> [CONTINUATION] Blended rot6d shape: {new_rot6d_blended.shape}")
+                                else:
+                                    new_rot6d_blended = new_rot6d
+                                
+                                # Concatenate with blended poses
+                                combined_rot6d = torch.cat([orig_rot6d, new_rot6d_blended], dim=1)  # (1, total_frames, 22, 6)
+                                
+                                print(f">>> [CONTINUATION] Combined rot6d shape: {combined_rot6d.shape}")
+                                
+                                # ====== TRANSLATION ALIGNMENT + BLENDING ======
+                                # Align the new motion to start where the original ended
+                                orig_last_transl = orig_transl[:, -1:, :]  # (1, 1, 3)
+                                new_first_transl = new_transl[:, :1, :]   # (1, 1, 3)
+                                
+                                # Calculate offset to align new motion with original's ending position
+                                transl_offset = orig_last_transl - new_first_transl  # (1, 1, 3)
+                                
+                                print(f">>> [CONTINUATION] Position alignment:")
+                                print(f"    Original end position: {orig_last_transl.squeeze().tolist()}")
+                                print(f"    New start position: {new_first_transl.squeeze().tolist()}")
+                                print(f"    Translation offset: {transl_offset.squeeze().tolist()}")
+                                
+                                # Apply offset to all frames of the new motion
+                                new_transl_aligned = new_transl + transl_offset  # (1, new_frames, 3)
+                                
+                                # Also blend translation for the first few frames for extra smoothness
+                                if blend_frames > 0:
+                                    blend_weights_transl = torch.linspace(0, 1, blend_frames, device=device).view(1, blend_frames, 1)
+                                    new_transl_start = new_transl_aligned[:, :blend_frames, :]
+                                    blended_transl = orig_last_transl * (1 - blend_weights_transl) + new_transl_start * blend_weights_transl
+                                    new_transl_blended = torch.cat([blended_transl, new_transl_aligned[:, blend_frames:, :]], dim=1)
+                                else:
+                                    new_transl_blended = new_transl_aligned
+                                
+                                # Concatenate with aligned and blended translation
+                                combined_transl = torch.cat([orig_transl, new_transl_blended], dim=1)  # (1, total_frames, 3)
+                                
+                                print(f">>> [CONTINUATION] Combined transl shape: {combined_transl.shape}")
+                                print(f">>> [CONTINUATION] Blending complete - smooth transition applied over {blend_frames} frames")
+                                
+                                # Update motion_data with combined motion
+                                motion_data['rot6d'] = combined_rot6d
+                                motion_data['transl'] = combined_transl
+                                
+                                # Update other fields if they exist
+                                if 'keypoints3d' in motion_data:
+                                    # For keypoints, we need to regenerate them from the combined rot6d/transl
+                                    # This is complex, so we'll skip it for now and let the visualization handle it
+                                    print(f">>> [CONTINUATION] Note: keypoints3d not updated (requires regeneration)")
+                                
+                                if 'root_rotations_mat' in motion_data:
+                                    # Remove root_rotations_mat as it will be regenerated
+                                    del motion_data['root_rotations_mat']
+                                
+                                print(f">>> [CONTINUATION] Combined motion: {orig_rot6d.shape[1]} + {new_rot6d.shape[1]} = {combined_rot6d.shape[1]} frames")
+                                print(f">>> [CONTINUATION] Original text: {starting_motion['text']}")
+                                print(f">>> [CONTINUATION] New text: {text}")
+                                
+                                # Update text to indicate continuation
+                                combined_text = f"[CONTINUATION] {starting_motion['text']} -> {text}"
+                            else:
+                                combined_text = text
+
                             # Save the motion data to disk first (let it use default output_dir)
                             print(f">>> Saving visualization data...")
                             memory_data, base_filename = save_visualization_data(
                                 output=motion_data,
-                                text=text,
-                                rewritten_text=text,  # Use same text since prompt engineering is disabled
+                                text=combined_text if continue_mode and starting_motion is not None else text,
+                                rewritten_text=combined_text if continue_mode and starting_motion is not None else text,
                                 timestamp=timestamp,
                                 output_dir=None,  # Use default
                                 output_filename=file_path,
@@ -716,6 +898,18 @@ class StreamingGradioApp:
                         info="Choose the output format for generated motions",
                     )
                     
+                    # Continuation options
+                    with gr.Accordion("🔄 Motion Continuation", open=False):
+                        self.continue_from_json = gr.File(
+                            label="📂 Upload Starting JSON (Optional)",
+                            file_count="single",
+                            file_types=[".json"],
+                        )
+                        self.continue_mode = gr.Checkbox(
+                            label="Enable Continuation Mode",
+                            value=False,
+                        )
+                    
                     # Generation buttons
                     with gr.Row():
                         self.stop_btn = gr.Button(
@@ -858,7 +1052,11 @@ class StreamingGradioApp:
                 self.seed_input,
                 self.duration_slider,
                 self.cfg_slider,
-                self.output_format  # output_format
+                self.output_format,  # output_format
+                gr.State(None),  # original_text
+                gr.State(None),  # output_dir
+                self.continue_from_json,  # continue_from_json
+                self.continue_mode,  # continue_mode
             ],
             outputs=[self.output_display, self.download_files]
         ).then(
