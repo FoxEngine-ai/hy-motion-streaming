@@ -53,10 +53,14 @@ class T2MRuntime:
         disable_prompt_engineering: bool = False,
         prompt_engineering_host: Optional[str] = None,
         prompt_engineering_model_path: Optional[str] = None,
+        quantization_mode: Optional[str] = None,
+        use_gguf: bool = False,
     ):
         self.config_path = config_path
         self.ckpt_name = ckpt_name
         self.skip_text = skip_text
+        self.quantization_mode = quantization_mode
+        self.use_gguf = use_gguf
         self.prompt_engineering_host = prompt_engineering_host
         self.prompt_engineering_model_path = prompt_engineering_model_path
         self.disable_prompt_engineering = disable_prompt_engineering
@@ -111,6 +115,105 @@ class T2MRuntime:
             )
         else:
             print(f">>> T2MRuntime loaded in IP {self.local_ip}, devices={device_info}")
+
+    @staticmethod
+    def apply_looping(
+        motion_data: dict, 
+        blend_duration: float = 0.5,
+        fps: float = 30.0
+    ) -> dict:
+        """
+        Apply looping by blending the end of the motion back to the start frame.
+        
+        Args:
+            motion_data: Dictionary containing motion data (rot6d, transl, etc.)
+            blend_duration: Duration of the blend in seconds
+            fps: Frames per second of the motion
+            
+        Returns:
+            Modified motion_data dictionary
+        """
+        print(f">>> Applying looping with blend duration {blend_duration}s...")
+        
+        # Check if we have necessary data
+        if 'rot6d' not in motion_data or 'transl' not in motion_data:
+            print(">>> [WARNING] Missing rot6d or transl for looping, skipping.")
+            return motion_data
+            
+        rot6d = motion_data['rot6d']   # (Batch, Frames, Joints, 6)
+        transl = motion_data['transl'] # (Batch, Frames, 3)
+        
+        device = rot6d.device
+        dtype = rot6d.dtype
+        
+        # Calculate blend frames
+        blend_frames = int(blend_duration * fps)
+        total_frames = rot6d.shape[1]
+        
+        if blend_frames >= total_frames // 2:
+            print(f">>> [WARNING] Motion too short for requested blend duration. Reducing blend.")
+            blend_frames = max(1, total_frames // 4)
+            
+        if blend_frames <= 0:
+            return motion_data
+            
+        # We will modify the last `blend_frames` to blend towards the first frame
+        
+        # 1. Get targets (first frame)
+        target_rot6d = rot6d[:, 0:1, :, :]      # (Batch, 1, Joints, 6)
+        target_transl = transl[:, 0:1, :]       # (Batch, 1, 3)
+        
+        # 2. Get the source frames (last N frames)
+        # We blend the last N frames. 
+        # Actually, for a perfect loop, we want the LAST frame to match the FIRST frame.
+        # But we also want the transition to be smooth.
+        # Strategy: Interpolate from (end - blend_frames) -> end  TO  (end - blend_frames) -> start
+        
+        # Let's extract the segment we want to modify
+        start_blend_idx = total_frames - blend_frames
+        
+        segment_rot6d = rot6d[:, start_blend_idx:, :, :]  # (B, blend_frames, J, 6)
+        segment_transl = transl[:, start_blend_idx:, :]   # (B, blend_frames, 3)
+        
+        # Create weights (0 at start of blend, 1 at end of blend)
+        weights = torch.linspace(0, 1, blend_frames, device=device, dtype=dtype)
+        # Reshape for broadcasting
+        # weights: (blend_frames,) -> need (1, blend_frames, 1, 1) for rot6d
+        w_rot = weights.view(1, blend_frames, 1, 1)
+        w_trans = weights.view(1, blend_frames, 1)
+        
+        # --- Interpolate Translation (LERP) ---
+        # Note: Translation must be relative to root? 
+        # If the character moved far away, snapping back to start position (0,0,0) might look weird if we don't handle root motion.
+        # For now, we assume we want to loop back to the EXACT start position.
+        
+        # LERP: result = src * (1 - w) + target * w
+        blended_transl = segment_transl * (1 - w_trans) + target_transl * w_trans
+        
+        # --- Interpolate Rotation (SLERP-ish for 6D) ---
+        # 6D rotation is continuous, so LERP usually works fine, but we can re-normalize.
+        # Ideally convert to Quat -> SLERP -> 6D, or Matrix -> 6D.
+        # Since we use 6D representation, simple linear interpolation + orthonormalization works well.
+        
+        blended_rot6d = segment_rot6d * (1 - w_rot) + target_rot6d * w_rot
+        
+        # Update the data
+        motion_data['rot6d'] = rot6d.clone()
+        motion_data['rot6d'][:, start_blend_idx:, :, :] = blended_rot6d
+        
+        motion_data['transl'] = transl.clone()
+        motion_data['transl'][:, start_blend_idx:, :] = blended_transl
+        
+        # If root_rotations_mat exists, it needs to be updated too or invalidated
+        if 'root_rotations_mat' in motion_data:
+            # Re-calculating proper rotation matrices from 6D is safest, 
+            # but simpler to just let valid downstream code handle it (like fbx converter)
+            # or we can try to blend if it matches shape
+            # For now, let's remove it to force regeneration if needed, or leave it if unused
+            pass
+            
+        print(">>> Looping applied successfully.")
+        return motion_data
 
     def _print_smplh_data(self, model_output: dict, text: str) -> None:
         """Print SMPL-H motion data for debugging and analysis."""
@@ -197,6 +300,8 @@ class T2MRuntime:
                 config["train_pipeline_args"],
                 network_module=config["network_module"],
                 network_module_args=config["network_module_args"],
+                quantization_mode=self.quantization_mode,
+                use_gguf=self.use_gguf,
             )
             device = torch.device("cpu")
             print(f">>> [DEBUG] Loading checkpoint from {self.ckpt_name}...")
@@ -222,6 +327,8 @@ class T2MRuntime:
                 config["train_pipeline_args"],
                 network_module=config["network_module"],
                 network_module_args=config["network_module_args"],
+                quantization_mode=self.quantization_mode,
+                use_gguf=self.use_gguf,
             )
             print(f">>> [DEBUG] Loading checkpoint from {self.ckpt_name}...")
             p.load_in_demo(
@@ -389,6 +496,7 @@ class T2MRuntime:
         output_filename: Optional[str] = None,
         original_text: Optional[str] = None,
         use_special_game_feat: bool = False,
+        apply_loop: bool = False,
     ) -> Tuple[Union[str, list[str]], dict]:
         self.load()
         seeds = [int(s.strip()) for s in seeds_csv.split(",") if s.strip() != ""]
@@ -421,6 +529,15 @@ class T2MRuntime:
                 model_output = pipeline.generate(
                     text, seeds, duration, cfg_scale=cfg_scale, use_special_game_feat=use_special_game_feat
                 )
+            
+            # Apply looping if requested
+            if apply_loop:
+                model_output = self.apply_looping(
+                    model_output, 
+                    blend_duration=0.5, # Default 0.5s blend
+                    fps=pipeline.output_mesh_fps
+                )
+
         finally:
             self._release_pipeline(pi)
 

@@ -196,15 +196,28 @@ class MotionGeneration(torch.nn.Module):
         self.motion_transformer.eval()
         if build_text_encoder and not self.uncondition_mode:
             self.text_encoder = load_object(self._text_encoder_module, self._text_encoder_cfg)
-            self.text_encoder.to(get_module_device(self))
+            if hasattr(self.text_encoder, "offload_to_cpu") and self.text_encoder.offload_to_cpu:
+                print(">>> [INFO] Text encoder set to CPU offload mode. Skipping .to(device).")
+            else:
+                self.text_encoder.to(get_module_device(self))
 
     @torch.no_grad()
     def encode_text(self, text: Dict[str, List[str]]) -> Dict[str, Tensor]:
         if not hasattr(self, "text_encoder"):
             self.text_encoder = load_object(self._text_encoder_module, self._text_encoder_cfg)
-            self.text_encoder.to(get_module_device(self))
+            if hasattr(self.text_encoder, "offload_to_cpu") and self.text_encoder.offload_to_cpu:
+                 pass # Stay on CPU
+            else:
+                self.text_encoder.to(get_module_device(self))
         text = text["text"]
         vtxt_input, ctxt_input, ctxt_length = self.text_encoder.encode(text=text)
+        
+        # Ensure outputs are on the correct device (main pipeline device)
+        device = get_module_device(self)
+        vtxt_input = vtxt_input.to(device)
+        ctxt_input = ctxt_input.to(device)
+        ctxt_length = ctxt_length.to(device)
+        
         return {
             "text_vec_raw": vtxt_input,
             "text_ctxt_raw": ctxt_input,
@@ -456,8 +469,18 @@ class MotionFlowMatching(MotionGeneration):
         losses_cfg: Optional[dict] = None,
         train_cfg: Optional[dict] = None,
         test_cfg: Optional[dict] = None,
+        quantization_mode: Optional[str] = None,
+        use_gguf: bool = False,
         **kwargs,
     ):
+        if quantization_mode is not None:
+            text_encoder_cfg["quantization_mode"] = quantization_mode
+        if use_gguf:
+            text_encoder_cfg["use_gguf"] = True
+            print(f">>> [DEBUG] MotionFlowMatching: use_gguf=True, updated text_encoder_cfg")
+        else:
+            print(f">>> [DEBUG] MotionFlowMatching: use_gguf={use_gguf}")
+
         super().__init__(
             network_module=network_module,
             network_module_args=network_module_args,

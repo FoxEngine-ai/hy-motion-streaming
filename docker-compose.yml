@@ -1,0 +1,29 @@
+services:
+  hy-motion:
+    build: .
+    image: hy-motion-streaming
+    container_name: hy-motion-dev
+    ports:
+      - "7860:7860"
+    shm_size: '48gb'
+    volumes:
+      # This maps your current code folder to /app for live-editing
+      - .:/app
+      # Persistent storage for models and outputs
+      - ./ckpts:/app/ckpts
+      - ./output:/app/output
+      - ./hf_cache:/root/.cache/huggingface
+    environment:
+      - DISABLE_PROMPT_ENGINEERING=1
+      - USE_HF_MODELS=0
+      - PYTHONPATH=/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ '0' ] # Targets your first GPU
+              capabilities: [ gpu ]
+    stdin_open: true # Allows -i (interactive)
+    tty: true # Allows -t (terminal)
+    # command: python gradio_app_streaming.py

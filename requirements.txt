@@ -10,6 +10,8 @@ transformers==4.53.3
 einops==0.8.1
 safetensors==0.5.3
 bitsandbytes==0.49.0
+gguf>=0.10.0
+llama-cpp-python
 
 numpy>=1.24.0,<2.0
 scipy>=1.10.0

@@ -5,6 +5,7 @@ FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
+ENV DISABLE_PROMPT_ENGINEERING=1
 
 # Install system dependencies
 RUN apt-get update && \
@@ -30,23 +31,16 @@ RUN python3 -m pip install --upgrade pip setuptools wheel
 
 # Create and set up working directory
 WORKDIR /app
-COPY . /app
+COPY requirements.txt .
 
-# Install Python dependencies with retry logic
-RUN pip install --no-cache-dir numpy scipy && \
-    pip install --no-cache-dir PyYAML==6.0 && \
-    pip install --no-cache-dir -r requirements.txt || \
-    (sleep 30 && pip install --no-cache-dir -r requirements.txt)
-
-# Install PyTorch with CUDA 12.1 support first
-RUN pip install --no-cache-dir \
-    torch==2.5.1+cu121 \
-    torchvision==0.20.1+cu121 \
-    torchaudio==2.5.1+cu121 \
-    --index-url https://download.pytorch.org/whl/cu121
-
+RUN python3 -m pip install --upgrade pip setuptools wheel && \
+    pip install numpy scipy PyYAML==6.0 && \
+    pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121 && \
+    pip install -r requirements.txt
+COPY . /app    
 # Verify all dependencies are installed
-RUN python -c "import sys; import gradio; import torch; import huggingface_hub; import numpy; import scipy; from hymotion.utils.t2m_runtime import T2MRuntime; from hymotion.pipeline.motion_diffusion import MotionFlowMatching; print('✅ All dependencies installed successfully'); print(f'Gradio: {gradio.__version__}'); print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}')"
+RUN python -c "import sys; import gradio; import torch; import huggingface_hub; import numpy; import scipy; import gguf; import llama_cpp; from hymotion.utils.t2m_runtime import T2MRuntime; from hymotion.pipeline.motion_diffusion import MotionFlowMatching; print('✅ All dependencies installed successfully'); print(f'Gradio: {gradio.__version__}'); print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}')"
 
 # Clean up
 RUN apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*

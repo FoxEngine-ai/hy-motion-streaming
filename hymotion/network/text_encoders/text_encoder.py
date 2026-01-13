@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -9,7 +9,17 @@ from transformers import (
     AutoTokenizer,
     CLIPTextModel,
     CLIPTokenizer,
+    BitsAndBytesConfig,
 )
+import numpy as np
+import traceback
+
+try:
+    from llama_cpp import Llama
+    LLAMA_CPP_AVAILABLE = True
+except ImportError:
+    Llama = None
+    LLAMA_CPP_AVAILABLE = False
 
 from ...utils.type_converter import get_module_device
 from .model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
@@ -55,8 +65,14 @@ class HYTextModel(nn.Module):
         sentence_emb_type: Optional[str] = "clipl",
         max_length_sentence_emb: int = 77,
         enable_llm_padding: bool = True,
+        quantization_mode: Optional[str] = None,
+        use_gguf: bool = False,
     ) -> None:
         super().__init__()
+        self.use_gguf = use_gguf
+        self.offload_to_cpu = True if use_gguf else False
+        if self.offload_to_cpu:
+            print(">>> [INFO] GGUF mode detected: Text encoder will be offloaded to CPU.")
         self.text_encoder_type = "hy_text_model"
 
         self.sentence_emb_type = sentence_emb_type
@@ -98,69 +114,255 @@ class HYTextModel(nn.Module):
                 LLM_ENCODER_LAYOUT[llm_type]["module_path"],
                 padding_side="right",
             )
-            self.llm_text_encoder = LLM_ENCODER_LAYOUT[llm_type]["text_encoder_class"].from_pretrained(
-                LLM_ENCODER_LAYOUT[llm_type]["module_path"], low_cpu_mem_usage=True
-            )
-            self.llm_text_encoder = self.llm_text_encoder.eval().requires_grad_(False)
-            self.ctxt_dim = self.llm_text_encoder.config.hidden_size
+            quantization_config = None
+            if quantization_mode == "4bit":
+                print(">>> [INFO] Using 4-bit quantization for LLM encoder")
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                )
+            elif quantization_mode == "8bit":
+                print(">>> [INFO] Using 8-bit quantization for LLM encoder")
+                quantization_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                )
+
+
+            # Check for GGUF if requested
+            gguf_file = None
+            if use_gguf:
+                if not LLAMA_CPP_AVAILABLE:
+                    print(">>> [WARNING] GGUF requested but llama-cpp-python not installed. Falling back to transformers.")
+                    self.use_gguf = False
+                    self.offload_to_cpu = False
+                else:
+                    print(f">>> [INFO] GGUF usage enabled. Looking for GGUF model...")
+                    module_path = LLM_ENCODER_LAYOUT[llm_type]["module_path"]
+                    abs_module_path = os.path.abspath(module_path)
+                    
+                    if os.path.exists(module_path) and os.path.isdir(module_path):
+                        found_files = []
+                        for root, dirs, files in os.walk(module_path):
+                            for file in files:
+                                if file.lower().endswith('.gguf'):
+                                    full_path = os.path.join(root, file)
+                                    rel_path = os.path.relpath(full_path, module_path)
+                                    found_files.append(full_path) # Store full path for llama-cpp
+                        
+                        if found_files:
+                            gguf_file = found_files[0]
+                            print(f">>> [INFO] Selected GGUF file: {gguf_file}")
+                        else:
+                            print(f">>> [WARNING] No .gguf file found in {abs_module_path}")
+                    
+            if self.use_gguf and gguf_file:
+                print(f">>> [INFO] Loading GGUF model via llama-cpp-python: {gguf_file}")
+                # Initialize Llama model
+                # n_gpu_layers=0 forces CPU. embedding=True enables embedding extraction.
+                # n_ctx should match max_length_llm or be sufficient.
+                self.llm_text_encoder = Llama(
+                    model_path=gguf_file,
+                    n_gpu_layers=0, # Force CPU
+                    n_ctx=self.max_length_llm + 256, # Validation buffer
+                    embedding=True,
+                    verbose=False
+                )
+                print(f">>> [INFO] Llama model loaded. Context size: {self.llm_text_encoder.n_ctx()}")
+                self.ctxt_dim = self.llm_text_encoder.n_embd() # Get embedding dim from model
+            else:
+                 # Standard Transformers loading
+                 if use_gguf:
+                     print(">>> [WARNING] Falling back to standard model loading (GGUF file not found or lib missing).")
+                     self.use_gguf = False
+                     self.offload_to_cpu = False
+                 
+                 self.llm_text_encoder = LLM_ENCODER_LAYOUT[llm_type]["text_encoder_class"].from_pretrained(
+                    LLM_ENCODER_LAYOUT[llm_type]["module_path"], 
+                    low_cpu_mem_usage=True,
+                    quantization_config=quantization_config,
+                 )
+                 self.llm_text_encoder = self.llm_text_encoder.eval().requires_grad_(False)
+                 self.ctxt_dim = self.llm_text_encoder.config.hidden_size
 
             self.crop_start = self._compute_crop_start()
             self.max_length_llm = self._orig_max_length_llm + self.crop_start
 
+    def _apply(self, fn):
+        super()._apply(fn)
+        # No special handling needed for llama-cpp object as it's not a torch module
+        return self
+
+    def to(self, *args, **kwargs):
+        # If using llama-cpp, the text encoder is not a torch module so .to() won't touch it anyway.
+        # But we still want to protect it if it WAS a torch module (fallback case).
+        # And we want to ensure other components move.
+        return super().to(*args, **kwargs)
+
+    def cuda(self, device=None):
+        return super().cuda(device)
+
     @torch.no_grad()
     def encode_llm(self, text: List[str]) -> Tuple[Tensor, Tensor]:
-        if self.llm_type is None or self.llm_text_encoder is None or self.llm_tokenizer is None:
-            raise ValueError("LLM model not initialized")
+        try:
 
-        device = get_module_device(self)
-        llm_text = [
-            (
-                self.llm_tokenizer.apply_chat_template(
-                    self.apply_text_to_template(one_text, LLM_ENCODER_LAYOUT[self.llm_type]["template"]),
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    enable_thinking=False,
+
+            if self.llm_type is None or self.llm_text_encoder is None or self.llm_tokenizer is None:
+                raise ValueError("LLM model not initialized")
+
+            device = get_module_device(self)
+
+            # Prepare text using the tokenizer (we still use AutoTokenizer for template/Ids)
+            llm_text = [
+                (
+                    self.llm_tokenizer.apply_chat_template(
+                        self.apply_text_to_template(one_text, LLM_ENCODER_LAYOUT[self.llm_type]["template"]),
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        enable_thinking=False,
+                    )
+                    if self.llm_type == "qwen3"
+                    else self.apply_text_to_template(one_text, LLM_ENCODER_LAYOUT[self.llm_type]["template"])
                 )
-                if self.llm_type == "qwen3"
-                else self.apply_text_to_template(one_text, LLM_ENCODER_LAYOUT[self.llm_type]["template"])
+                for one_text in text
+            ]
+            
+            # We need token IDs. Llama-cpp can tokenize, but we want to ensure consistency with the expected template.
+            # So we use the HF tokenizer to get IDs, then feed IDs to llama-cpp.
+            
+            # Tokenize with HF tokenizer
+            padding_mode = "max_length" if self.enable_llm_padding else False
+            llm_batch_encoding = self.llm_tokenizer(
+                llm_text,
+                return_length=False,
+                return_overflowing_tokens=False,
+                truncation=True,
+                return_attention_mask=True,
+                max_length=self.max_length_llm,
+                padding=padding_mode,
+                return_tensors="pt", # Return PyTorch tensors initially
             )
-            for one_text in text
-        ]
-        padding_mode = "max_length" if self.enable_llm_padding else False
-        llm_batch_encoding = self.llm_tokenizer(
-            llm_text,
-            return_length=False,
-            return_overflowing_tokens=False,
-            truncation=True,
-            return_attention_mask=True,
-            max_length=self.max_length_llm,  # = crop_start + _orig_max_length_llm
-            padding=padding_mode,
-            return_tensors="pt",
-        )
-        llm_outputs = (
-            self.llm_text_encoder(
-                input_ids=llm_batch_encoding["input_ids"].to(device),
-                attention_mask=llm_batch_encoding["attention_mask"].to(device),
-                output_hidden_states=True,
-            )
-            if self.llm_type == "qwen3"
-            else self.llm_text_encoder(
-                input_ids=llm_batch_encoding["input_ids"].to(device),
-                attention_mask=llm_batch_encoding["attention_mask"].to(device),
-            )
-        )
-        if self.llm_type == "qwen3":
-            ctxt_raw = llm_outputs.hidden_states[-1]
-        else:
-            ctxt_raw = llm_outputs.last_hidden_state
+            
+            if self.use_gguf and isinstance(self.llm_text_encoder, Llama):
+                # Llama-cpp inference path
+                input_ids = llm_batch_encoding["input_ids"].cpu().numpy() # [Batch, Seq]
+                attention_mask = llm_batch_encoding["attention_mask"].cpu().numpy()
+                
+                # Storage for embeddings
+                batch_embeddings = []
+                
+                # Backup original tokenize method
+                original_tokenize = self.llm_text_encoder.tokenize
+                
+                for i in range(len(input_ids)):
+                    # Get HF Token IDs (which we know are correct for the model weights)
+                    hf_ids = input_ids[i].tolist()
+                    hf_len = int(np.sum(attention_mask[i]))
+                    hf_valid_ids = hf_ids[:hf_len]
+                    
+                    # Define a closure that returns OUR tokens, ignoring input text
+                    # llama_cpp.Llama.tokenize signature: (self, text: bytes, add_bos: bool = True, special: bool = False) -> List[int]
+                    def mock_tokenize(text, add_bos=True, special=False):
+                        # We return the HF IDs directly. 
+                        # Important: HF IDs might already include BOS/Special tokens.
+                        # We trust HF tokenizer output completely.
+                        return hf_valid_ids
 
-        start = self.crop_start
-        end = start + self._orig_max_length_llm
-        ctxt_raw = ctxt_raw[:, start:end].contiguous()  # [bs, _orig_max_length_llm, hidden]
-        ctxt_length = (llm_batch_encoding["attention_mask"].sum(dim=-1).to(device) - start).clamp(
-            min=0, max=self._orig_max_length_llm
-        )
-        return ctxt_raw, ctxt_length
+                    # Apply Monkeypatch
+                    self.llm_text_encoder.tokenize = mock_tokenize
+                    
+                    try:
+                         # Call embed. It will call self.tokenize(), which now returns hf_valid_ids.
+                         # Logic: embed("dummy") -> tokenize("dummy") -> hf_valid_ids -> eval(hf_valid_ids) -> embeddings
+                         token_embeddings = self.llm_text_encoder.embed("mock_string_to_trigger_mock_tokenize")
+                    except Exception as e:
+                         print(f">>> [ERROR] Llama embedding failed with mock tokenizer: {e}")
+                         traceback.print_exc()
+                         # Fallback to zeros to avoid crash
+                         token_embeddings = None
+                    finally:
+                         # Restore immediately
+                         self.llm_text_encoder.tokenize = original_tokenize
+
+                    
+                    # Valid output check
+                    if isinstance(token_embeddings, list) and len(token_embeddings) > 0:
+                        if isinstance(token_embeddings[0], float):
+                            print(">>> [WARNING] Llama.embed returned a flat list (single vector). We need sequence embeddings!")
+                            token_embeddings_tensor = torch.tensor(token_embeddings, dtype=torch.float32).unsqueeze(0)
+                        else:
+                            token_embeddings_tensor = torch.tensor(token_embeddings, dtype=torch.float32)
+                    else:
+                         if token_embeddings is None:
+                             print(f">>> [ERROR] Embeddings were None")
+                         else:
+                             print(f">>> [ERROR] Unexpected embed output type: {type(token_embeddings)}")
+                         token_embeddings_tensor = torch.zeros((1, self.ctxt_dim))
+
+                    # Pad back to full length
+                    if len(token_embeddings_tensor) < self.max_length_llm:
+                        pad_len = self.max_length_llm - len(token_embeddings_tensor)
+                        pad_tensor = torch.zeros((pad_len, self.ctxt_dim), dtype=torch.float32)
+                        token_embeddings_tensor = torch.cat((token_embeddings_tensor, pad_tensor), dim=0)
+                    else:
+                        token_embeddings_tensor = token_embeddings_tensor[:self.max_length_llm]
+                        
+                    batch_embeddings.append(token_embeddings_tensor)
+                
+                # Restore original just in case loop failed (covered by try/finally inside, but good practice if structure changes)
+                self.llm_text_encoder.tokenize = original_tokenize 
+
+
+
+            
+                # Stack batch (Still inside if)
+                ctxt_raw = torch.stack(batch_embeddings).to(device) # [Batch, MaxLen, Dim]
+                
+                # Crop/Slice to match original logic
+                start = self.crop_start
+                end = start + self._orig_max_length_llm
+                ctxt_raw = ctxt_raw[:, start:end].contiguous()
+                
+                # Recalculate length based on mask
+                ctxt_length = (llm_batch_encoding["attention_mask"].sum(dim=-1).to(device) - start).clamp(
+                    min=0, max=self._orig_max_length_llm
+                )
+                
+                return ctxt_raw, ctxt_length
+
+            else:
+                # Standard Transformers inference path
+                llm_outputs = (
+                    self.llm_text_encoder(
+                        input_ids=llm_batch_encoding["input_ids"].to(device),
+                        attention_mask=llm_batch_encoding["attention_mask"].to(device),
+                        output_hidden_states=True,
+                    )
+                    if self.llm_type == "qwen3"
+                    else self.llm_text_encoder(
+                        input_ids=llm_batch_encoding["input_ids"].to(device),
+                        attention_mask=llm_batch_encoding["attention_mask"].to(device),
+                    )
+                )
+                if self.llm_type == "qwen3":
+                    ctxt_raw = llm_outputs.hidden_states[-1]
+                else:
+                    ctxt_raw = llm_outputs.last_hidden_state
+        
+                start = self.crop_start
+                end = start + self._orig_max_length_llm
+                ctxt_raw = ctxt_raw[:, start:end].contiguous()  # [bs, _orig_max_length_llm, hidden]
+                ctxt_length = (llm_batch_encoding["attention_mask"].sum(dim=-1).to(device) - start).clamp(
+                    min=0, max=self._orig_max_length_llm
+                )
+                return ctxt_raw, ctxt_length
+            
+        except Exception as e:
+            print(f">>> [ERROR] Exception in encode_llm: {e}")
+            traceback.print_exc()
+            raise e
+
 
     @torch.no_grad()
     def encode_sentence_emb(self, text: List[str]) -> Tensor:
@@ -201,9 +403,15 @@ class HYTextModel(nn.Module):
         return vtxt_raw
 
     def encode(self, text: List[str]) -> Tuple[Tensor, Tensor, Tensor]:
-        ctxt_raw, ctxt_length = self.encode_llm(text=text)
-        vtxt_raw = self.encode_sentence_emb(text=text)
-        return vtxt_raw, ctxt_raw, ctxt_length
+        try:
+            ctxt_raw, ctxt_length = self.encode_llm(text=text)
+            vtxt_raw = self.encode_sentence_emb(text=text)
+            return vtxt_raw, ctxt_raw, ctxt_length
+        except Exception as e:
+             print(f">>> [ERROR] Exception in HYTextModel.encode: {e}")
+             traceback.print_exc()
+             raise e
+
 
     @staticmethod
     def apply_text_to_template(text: str, template: Union[str, list]) -> Union[str, list]:

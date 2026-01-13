@@ -40,6 +40,10 @@ _runtime_lock = threading.Lock()
 _frame_queue = queue.Queue()
 _stop_streaming = threading.Event()
 
+# Global settings
+_quantization_mode = None
+_use_gguf = False
+
 def _init_runtime_if_needed() -> 'StreamingT2MRuntime':
     """Initialize the runtime instance if not already created."""
     global _runtime_instance
@@ -86,7 +90,10 @@ def _init_runtime_if_needed() -> 'StreamingT2MRuntime':
                 device_ids=[0],  # Force GPU 0
                 disable_prompt_engineering=True,  # Disable for streaming demo
                 skip_model_loading=skip_model_loading,
+                quantization_mode=_quantization_mode,
+                use_gguf=_use_gguf,
             )
+            print(f">>> [DEBUG] Initialized StreamingT2MRuntime with use_gguf={_use_gguf}")
     
     return _runtime_instance
 
@@ -107,6 +114,9 @@ class StreamingT2MRuntime(T2MRuntime):
         disable_prompt_engineering: bool = False,
         prompt_engineering_host: Optional[str] = None,
         prompt_engineering_model_path: Optional[str] = None,
+
+        quantization_mode: Optional[str] = None,
+        use_gguf: bool = False,
     ):
         # Note: Quantization disabled for now due to dtype mismatches in ODE solver
         # Diffusion models require careful mixed precision handling
@@ -121,7 +131,10 @@ class StreamingT2MRuntime(T2MRuntime):
             disable_prompt_engineering=disable_prompt_engineering,
             prompt_engineering_host=prompt_engineering_host,
             prompt_engineering_model_path=prompt_engineering_model_path,
+            quantization_mode=quantization_mode,
+            use_gguf=use_gguf,
         )
+        print(f">>> [DEBUG] StreamingT2MRuntime.__init__ use_gguf={use_gguf}")
     
     def generate_motion_streaming(
         self,
@@ -131,6 +144,7 @@ class StreamingT2MRuntime(T2MRuntime):
         cfg_scale: float,
         output_format: str = "dict",
         use_special_game_feat: bool = False,
+        apply_loop: bool = False,
         frame_callback=None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
@@ -222,6 +236,9 @@ class StreamingT2MRuntime(T2MRuntime):
                 random_generator_on_gpu=pipeline.random_generator_on_gpu,
             )
 
+            # Apply looping logic during post-processing
+            # Note: We can't easily loop the ODE trajectory itself, so we apply it after generation
+            
             # Generate the full trajectory using proper ODE solver
             print(f">>> Starting ODE solver for {length} frames ({duration}s @ {pipeline.output_mesh_fps}fps)...")
             ode_start_time = time.time()
@@ -292,6 +309,14 @@ class StreamingT2MRuntime(T2MRuntime):
                         should_apply_smooothing=True
                     )
                     
+                    # Apply looping if requested (only for final result)
+                    if apply_loop:
+                        final_output = self.apply_looping(
+                            final_output, 
+                            blend_duration=0.5, # Default 0.5s blend
+                            fps=pipeline.output_mesh_fps
+                        )
+                    
                     final_data = {
                         "frame_index": len(t) - 1,
                         "total_frames": len(t) - 1,
@@ -348,6 +373,7 @@ def streaming_generate_motion(
     output_dir: Optional[str] = None,
     continue_from_json: Optional[str] = None,
     continue_mode: bool = False,
+    apply_loop: bool = False,
 ) -> Generator[Tuple[str, List[str]], None, None]:
     """
     Streaming version of motion generation that yields HTML updates and file lists.
@@ -418,6 +444,7 @@ def streaming_generate_motion(
                     duration=motion_duration,
                     cfg_scale=cfg_scale,
                     output_format=output_format,
+                    apply_loop=apply_loop,
                 )
                 
                 for frame_data in frame_generator:
@@ -910,6 +937,13 @@ class StreamingGradioApp:
                             value=False,
                         )
                     
+                    with gr.Row():
+                        self.apply_loop = gr.Checkbox(
+                            label="Loop Motion",
+                            value=False, 
+                            info="Blend end back to start (0.5s)"
+                        )
+                    
                     # Generation buttons
                     with gr.Row():
                         self.stop_btn = gr.Button(
@@ -1053,6 +1087,7 @@ class StreamingGradioApp:
                 gr.State(None),  # output_dir
                 self.continue_from_json,  # continue_from_json
                 self.continue_mode,  # continue_mode
+                self.apply_loop, # apply_loop
             ],
             outputs=[self.output_display, self.download_files]
         ).then(
@@ -1120,8 +1155,28 @@ if __name__ == "__main__":
         action="store_true",
         help="Create a public shareable link"
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["4bit", "8bit"],
+        help="Enable 4-bit or 8-bit quantization for lower VRAM usage"
+    )
+    parser.add_argument(
+        "--gguf",
+        action="store_true",
+        help="Use GGUF model for Qwen encoder if available"
+    )
     
     args = parser.parse_args()
     
     print(f">>> Starting HY-Motion 1.0 Streaming Interface on port {args.port}")
+    if args.quantization:
+        print(f">>> [INFO] Quantization enabled: {args.quantization}")
+        _quantization_mode = args.quantization
+
+    if args.gguf:
+        print(f">>> [INFO] GGUF usage enabled")
+        _use_gguf = True
+        
     main(args)

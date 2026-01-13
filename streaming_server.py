@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 
 import torch
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -37,12 +37,20 @@ from hymotion.utils.type_converter import get_module_device
 _runtime_instance: Optional['StreamingT2MRuntime'] = None
 _runtime_lock = threading.Lock()
 
+# Global settings (to mirror gradio_app_streaming behavior)
+_quantization_mode = None
+_use_gguf = False
 
-def _init_runtime_if_needed() -> 'StreamingT2MRuntime':
+
+def _init_runtime_if_needed(app: Optional[FastAPI] = None) -> 'StreamingT2MRuntime':
     """Initialize the runtime instance if not already created."""
     global _runtime_instance
     
     with _runtime_lock:
+        # Get settings from app state if available, otherwise use globals/defaults
+        config_quantization = getattr(app.state, "quantization", None) if app else _quantization_mode
+        config_gguf = getattr(app.state, "gguf", False) if app else _use_gguf
+
         if _runtime_instance is None:
             print(">>> Initializing StreamingT2MRuntime for FastAPI...")
             
@@ -78,6 +86,8 @@ def _init_runtime_if_needed() -> 'StreamingT2MRuntime':
                 device_ids=[0],
                 disable_prompt_engineering=True,
                 skip_model_loading=skip_model_loading,
+                quantization_mode=config_quantization,
+                use_gguf=config_gguf,
             )
     
     return _runtime_instance
@@ -97,6 +107,9 @@ class StreamingT2MRuntime(T2MRuntime):
         disable_prompt_engineering: bool = False,
         prompt_engineering_host: Optional[str] = None,
         prompt_engineering_model_path: Optional[str] = None,
+
+        quantization_mode: Optional[str] = None,
+        use_gguf: bool = False,
     ):
         print(">>> [INFO] Loading model in FP32 on GPU 0")
         super().__init__(
@@ -109,6 +122,8 @@ class StreamingT2MRuntime(T2MRuntime):
             disable_prompt_engineering=disable_prompt_engineering,
             prompt_engineering_host=prompt_engineering_host,
             prompt_engineering_model_path=prompt_engineering_model_path,
+            quantization_mode=quantization_mode,
+            use_gguf=use_gguf,
         )
     
     def generate_motion(
@@ -265,7 +280,7 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown."""
     print(">>> FastAPI server starting, initializing runtime...")
     try:
-        _init_runtime_if_needed()
+        _init_runtime_if_needed(app)
         print(">>> Runtime initialized successfully")
     except Exception as e:
         print(f">>> Warning: Failed to initialize runtime on startup: {e}")
@@ -309,7 +324,7 @@ async def health_check():
 
 
 @app.post("/generate", response_model=GenerateResponse)
-async def generate_motion(request: GenerateRequest):
+async def generate_motion(request: GenerateRequest, fastapi_req: Request):
     """
     Generate motion from a text prompt.
     
@@ -320,7 +335,7 @@ async def generate_motion(request: GenerateRequest):
     - betas: Body shape parameters
     """
     try:
-        runtime = _init_runtime_if_needed()
+        runtime = _init_runtime_if_needed(fastapi_req.app)
         
         result = runtime.generate_motion(
             text=request.prompt,
@@ -399,7 +414,46 @@ async def generate_motion_get(
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
+    
+    # Add command line argument parsing
+    parser = argparse.ArgumentParser(description="HY-Motion 1.0 Streaming Server")
+    parser.add_argument(
+        "--host", 
+        type=str, 
+        default="0.0.0.0", 
+        help="Host to bind the server to"
+    )
+    parser.add_argument(
+        "--port", 
+        type=int, 
+        default=7860, 
+        help="Port to run the server on"
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["4bit", "8bit"],
+        help="Enable 4-bit or 8-bit quantization for lower VRAM usage"
+    )
+    parser.add_argument(
+        "--gguf",
+        action="store_true",
+        help="Use GGUF model for Qwen encoder if available"
+    )
+    
+    args = parser.parse_args()
+
+    # Update app state
+    if args.quantization:
+        print(f">>> [INFO] Quantization enabled: {args.quantization}")
+        app.state.quantization = args.quantization
+
+    if args.gguf:
+        print(f">>> [INFO] GGUF usage enabled")
+        app.state.gguf = True
     
     print("=" * 60)
     print("HY-Motion Streaming Server")
@@ -410,15 +464,15 @@ if __name__ == "__main__":
     print("  POST /generate      - Generate motion (JSON body)")
     print("  GET  /generate      - Generate motion (query params)")
     print("\nExample:")
-    print('  curl "http://localhost:7860/generate?prompt=a%20person%20walking"')
-    print('  curl -X POST http://localhost:7860/generate -H "Content-Type: application/json" \\')
+    print(f'  curl "http://{args.host}:{args.port}/generate?prompt=a%20person%20walking"')
+    print(f'  curl -X POST http://{args.host}:{args.port}/generate -H "Content-Type: application/json" \\')
     print('       -d \'{"prompt": "a person dancing", "duration": 5, "cfg_scale": 7}\'')
     print("=" * 60)
     
     uvicorn.run(
-        "streaming_server:app",
-        host="0.0.0.0",
-        port=7860,
+        app,
+        host=args.host,
+        port=args.port,
         reload=False,
         log_level="info",
     )
