@@ -15,9 +15,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
-from openai import OpenAI
 from requests import exceptions as req_exc
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# `from openai import OpenAI` is imported lazily inside OpenAIChatApi.__init__ —
+# users running with disable_prompt_engineering=True (or anyone who never
+# constructs an OpenAIChatApi) shouldn't have to install the openai package.
 
 from .model_constants import REWRITE_AND_INFER_TIME_PROMPT_FORMAT
 
@@ -54,6 +57,9 @@ class ResponseParseError(Exception):
 
 class OpenAIChatApi:
     def __init__(self, config: ApiConfig) -> None:
+        # Lazy import — see top-of-file comment.
+        from openai import OpenAI
+
         self.logger = logging.getLogger(__name__)
         self.config = config
         self.client = OpenAI(

@@ -26,12 +26,21 @@ from .model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
 USE_HF_MODELS = os.environ.get("USE_HF_MODELS", "0") == "1"
 
+# Default paths preserved from upstream:
+#   USE_HF_MODELS=1 → use HuggingFace hub IDs (auto-download)
+#   default        → use cwd-relative ./ckpts (matches the gradio demo run script)
 if USE_HF_MODELS:
     QWEN_PATH = "Qwen/Qwen3-8B"
     CLIP_PATH = "openai/clip-vit-large-patch14"
 else:
     QWEN_PATH = "ckpts/Qwen3-8B"
     CLIP_PATH = "ckpts/clip-vit-large-patch14"
+
+# Per-encoder env-var overrides — let library callers (e.g. when imported into
+# another process that maintains its own model cache layout) point at specific
+# paths without monkey-patching the LAYOUT dicts. Empty / unset = use defaults.
+QWEN_PATH = os.environ.get("HYMOTION_QWEN_PATH") or QWEN_PATH
+CLIP_PATH = os.environ.get("HYMOTION_CLIP_PATH") or CLIP_PATH
 
 LLM_ENCODER_LAYOUT = {
     "qwen3": {

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,15 @@ from torch import Tensor
 from ..utils.geometry import (
     rot6d_to_rotation_matrix,
     rotation_matrix_to_angle_axis,
+)
+
+# Wooden-mesh asset directory (the .bin / .webp files that ship with the
+# package under hymotion/assets/dump_wooden/). Resolved relative to this
+# file rather than cwd so pip-installed users get the bundled copy without
+# any setup. Override via HYMOTION_WOODEN_PATH env var if you've extracted
+# the assets to a different location.
+_DEFAULT_WOODEN_PATH = os.environ.get("HYMOTION_WOODEN_PATH") or str(
+    Path(__file__).resolve().parent.parent / "assets" / "dump_wooden"
 )
 
 # yapf: disable
@@ -222,8 +232,10 @@ class WoodenMesh(torch.nn.Module):
     Uses simple LBS without shape blending (fixed skeleton).
     """
 
-    def __init__(self, model_path="scripts/gradio/static/assets/dump_wooden"):
+    def __init__(self, model_path=None):
         torch.nn.Module.__init__(self)
+        if model_path is None:
+            model_path = _DEFAULT_WOODEN_PATH
 
         # Load model data from .bin files
         model = load_model_data(model_path)
@@ -390,8 +402,7 @@ def construct_smpl_data_dict(
 
 if __name__ == "__main__":
     # python -m hymotion.pipeline.body_model
-    model_path = "scripts/gradio/static/assets/dump_wooden"
-    model = WoodenMesh(model_path)
+    model = WoodenMesh()  # uses bundled hymotion/assets/dump_wooden/
     params = {
         "rot6d": torch.randn(1, 52, 6),
         "trans": torch.randn(1, 3),

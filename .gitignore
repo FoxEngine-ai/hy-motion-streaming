@@ -1,4 +1,4 @@
-cache_config.json
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -8,14 +8,46 @@ __pycache__/
 *.pywz
 *.pyzw
 *.pyzwz
-cache
+*.egg-info/
+build/
+dist/
+*.egg
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
 
+# Caches / build artifacts
+cache
+cache_config.json
+build.log
+build_test.log
+=*
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
 .vscode/
 
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights & downloads (kept out of source control — pulled by user / Voxta resolver)
 ckpts/*
 !ckpts/README.md
+downloaded_models/
+hf_cache/
 
+# Generated outputs from inference runs
+output/
+output_converted/
+
+# Local debug / scratch
 test_*/
 debug
 tencent
-output

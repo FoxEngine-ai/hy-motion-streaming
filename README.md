@@ -10,7 +10,10 @@
     <img src="https://img.shields.io/badge/Official%20Site-333399.svg?logo=homepage" height="22px" alt="Official Site">
   </a>
   <a href="https://github.com/Tencent-Hunyuan/HY-Motion-1.0" target="_blank">
-    <img src="https://img.shields.io/badge/GitHub-Repo-181717?logo=github&logoColor=white" height="22px" alt="Github Repo">
+    <img src="https://img.shields.io/badge/Upstream-Tencent--Hunyuan-181717?logo=github&logoColor=white" height="22px" alt="Upstream Repo">
+  </a>
+  <a href="https://github.com/FoxEngine-ai/hy-motion-streaming" target="_blank">
+    <img src="https://img.shields.io/badge/Fork-FoxEngine--ai-1F6FEB?logo=github&logoColor=white" height="22px" alt="Fork">
   </a>
   <a href="https://huggingface.co/spaces/tencent/HY-Motion-1.0" target="_blank">
     <img src="https://img.shields.io/badge/%F0%9F%A4%97%20Demo-276cb4.svg" height="22px" alt="HuggingFace Space">
@@ -21,23 +24,110 @@
   <a href="https://arxiv.org/pdf/2512.23464" target="_blank">
     <img src="https://img.shields.io/badge/Report-b5212f.svg?logo=arxiv" height="22px" alt="ArXiv Report">
   </a>
-  <a href="https://x.com/TencentHunyuan" target="_blank">
-    <img src="https://img.shields.io/badge/Hunyuan-black.svg?logo=x" height="22px" alt="X (Twitter)">
-  </a>
 </div>
 
 
-# HY-Motion 1.0: Scaling Flow Matching Models for 3D Motion Generation
+# HY-Motion 1.0 — FoxEngine streaming fork
 
+> **Fork notice.** This repository is a downstream fork of
+> [Tencent-Hunyuan/HY-Motion-1.0](https://github.com/Tencent-Hunyuan/HY-Motion-1.0)
+> maintained by [FoxEngine.ai](https://github.com/FoxEngine-ai). All credit
+> for the underlying model, training pipeline, and research belongs to the
+> original Tencent Hunyuan 3D Digital Human Team.
+>
+> This fork adds the production-shape glue we needed for live integrations
+> (Voxta in particular): pip-installability, real-time frame streaming,
+> motion continuation across clips, GGUF / 4-bit quantization paths, and
+> Docker deployment. The core inference code is unchanged.
 
-<p align="center">
-  <img src="./assets/teaser.jpg" alt="Teaser" width="100%">
-</p>
+## What this fork adds
 
+| Feature | What it does | Where to read more |
+|---|---|---|
+| **Pip-installable** | `pip install git+...` produces a usable library — assets bundled, paths resolved relative to package | this README |
+| **Real-time streaming** | Generates motion frame-by-frame and streams to the UI as it goes, instead of holding everything until generation completes | [STREAMING.md](STREAMING.md) |
+| **Motion continuation** | Use the last frames of one generation as the seed for the next — chain "walk → run → jump" without seam discontinuities | [STREAMING.md](STREAMING.md#motion-continuation) |
+| **GGUF text encoder** | Run Qwen3-8B as a 4 GB GGUF on CPU via llama-cpp-python instead of the full 16 GB safetensors download | [DEPLOYMENT.md](DEPLOYMENT.md#quantization) |
+| **4-bit / 8-bit quantization** | bitsandbytes-backed quantization for the prompter model + main motion encoder | [DEPLOYMENT.md](DEPLOYMENT.md#quantization) |
+| **REST API server** | Headless inference endpoint (`streaming_server.py`) for embedding into other applications | [STREAMING.md](STREAMING.md#rest-api) |
+| **Docker + Makefile** | Reproducible builds for deployment, with `make` shortcuts for the common workflows | [DEPLOYMENT.md](DEPLOYMENT.md) |
 
-## 🔥 News
-- **Dec 30, 2025**: 🤗 We released the inference code and pretrained models of [HY-Motion 1.0](https://huggingface.co/tencent/HY-Motion-1.0). Please give it a try via our [HuggingFace Space](https://huggingface.co/spaces/tencent/HY-Motion-1.0) and our [Official Site](https://hunyuan.tencent.com/motion)!
+## Install
 
+```bash
+pip install git+https://github.com/FoxEngine-ai/hy-motion-streaming.git
+```
+
+This installs the `hymotion` Python package along with its dependencies. The
+wooden-mesh assets needed by `WoodenMesh` ship inside the wheel so no
+auxiliary asset download is required for that path.
+
+You still need to download the **HY-Motion model checkpoint** and the
+**Qwen3-8B text encoder** separately — they're large and not bundled with
+the package. See [Model weights](#model-weights) below.
+
+For development:
+
+```bash
+git clone https://github.com/FoxEngine-ai/hy-motion-streaming.git
+cd hy-motion-streaming
+pip install -e .
+```
+
+## Library usage (quick start)
+
+```python
+from hymotion.utils.t2m_runtime import T2MRuntime
+
+runtime = T2MRuntime(
+    config_path="path/to/HY-Motion-1.0/config.yml",
+    ckpt_name="latest.ckpt",                    # bare filename, resolved against config_path's dir
+    device_ids=[0],                             # GPU ids; pass an empty list or use force_cpu=True for CPU
+    use_gguf=True,                              # GGUF path for the Qwen text encoder (CPU-friendly)
+    disable_prompt_engineering=True,            # skip the OpenAI-backed prompt rewriter
+)
+
+html, files, motion_dict = runtime.generate_motion(
+    prompt="a person waving",
+    duration_seconds=3.0,
+    cfg_scale=5.0,
+    seed=42,
+)
+
+# motion_dict carries rot6d, transl, keypoints3d for the generated frames
+```
+
+To override the text-encoder paths without editing code, set environment
+variables before starting the process:
+
+```bash
+export HYMOTION_QWEN_PATH=/path/to/your/Qwen3-8B-GGUF/
+export HYMOTION_CLIP_PATH=openai/clip-vit-large-patch14   # or a local path
+```
+
+## Model weights
+
+The HY-Motion checkpoint and Qwen3 / CLIP text encoders are downloaded
+separately:
+
+| Asset | Source | Notes |
+|---|---|---|
+| HY-Motion-1.0 (1B) | [HF: tencent/HY-Motion-1.0](https://huggingface.co/tencent/HY-Motion-1.0/tree/main/HY-Motion-1.0) | Standard model, ~45 GB |
+| HY-Motion-1.0-Lite (0.46B) | [HF: tencent/HY-Motion-1.0/HY-Motion-1.0-Lite](https://huggingface.co/tencent/HY-Motion-1.0/tree/main/HY-Motion-1.0-Lite) | Lightweight variant |
+| Qwen3-8B (full) | [HF: Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | 16 GB safetensors |
+| Qwen3-8B (GGUF, 4-bit) | [HF: unsloth/Qwen3-8B-GGUF](https://huggingface.co/unsloth/Qwen3-8B-GGUF) | ~5 GB, runs on CPU via llama-cpp-python |
+| CLIP ViT-L/14 | [HF: openai/clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) | Auto-downloaded by transformers if path is the hub ID |
+
+See [`ckpts/README.md`](ckpts/README.md) for the original Tencent download
+instructions. Tools like `huggingface-cli download` work fine.
+
+---
+
+# Upstream documentation
+
+The remainder of this file is the upstream Tencent README, preserved
+verbatim — the model architecture, training pipeline, and research credits
+remain unchanged from Tencent's release.
 
 ## **Introduction**
 
@@ -71,8 +161,6 @@
 </p>
 
 
-
-
 ## 🎁 Model Zoo
 
 **HY-Motion 1.0 Series**
@@ -83,17 +171,16 @@
 | **HY-Motion-1.0-Lite** | Lightweight Text to Motion Generation Model | 2025-12-30 | 0.46B | [Download](https://huggingface.co/tencent/HY-Motion-1.0/tree/main/HY-Motion-1.0-Lite) |
 
 
+## 🤗 Get Started with HY-Motion 1.0 (upstream gradio demo)
 
-## 🤗 Get Started with HY-Motion 1.0
+> The instructions below run Tencent's original gradio demo from a source
+> checkout. For library / pip-install usage, see [Library usage](#library-usage-quick-start)
+> further up. For streaming, REST API, or Docker deployment, see the
+> dedicated guides linked at the top of this README.
 
 HY-Motion 1.0 supports macOS, Windows, and Linux.
 
-
-- [Code Usage (CLI)](#code-usage-cli)
-- [Gradio App](#gradio-app)
-
-
-#### 1. Installation
+### Installation
 
 First, install PyTorch via the [official site](https://pytorch.org/). Then install the dependencies:
 
@@ -101,7 +188,8 @@ First, install PyTorch via the [official site](https://pytorch.org/). Then insta
 pip install -r requirements.txt
 ```
 
-#### 2. Download Model Weights
+### Download Model Weights
+
 Please follow the instructions in [ckpts/README.md](ckpts/README.md) to download the necessary model weights.
 
 ### Code Usage (CLI)
@@ -125,7 +213,6 @@ python3 local_infer.py --model_path ckpts/tencent/HY-Motion-1.0-Lite
     - **Download**: You can download the Duration Prediction & Prompt Rewrite Module from [Here](https://huggingface.co/Text2MotionPrompter/Text2MotionPrompter).
     - **Note**: If you **do not** set these  parameter, you must also set `--disable_duration_est` and `--disable_rewrite`. Otherwise, the script will raise an error due to host unavailable.
 
-
 ### Gradio App
 
 You can host a [Gradio](https://www.gradio.app/) web interface on your local machine for interactive visualization:
@@ -133,12 +220,15 @@ You can host a [Gradio](https://www.gradio.app/) web interface on your local mac
 ```bash
 python3 gradio_app.py
 ```
-After running the command, open your browser and visit `http://localhost:7860`
+
+After running the command, open your browser and visit `http://localhost:7860`.
+
+For the **streaming variant** of the gradio app added by this fork, see [STREAMING.md](STREAMING.md).
 
 
 ## 🔗 BibTeX
 
-If you found this repository helpful, please cite our reports:
+If you found this repository helpful, please cite the upstream report:
 
 ```bibtex
 @article{hymotion2025,
