@@ -43,6 +43,11 @@ setup(
     keywords="motion-generation text-to-motion 3d-animation diffusion-transformer flow-matching",
     include_package_data=True,
     package_data={
+        # The .bin / .webp / .json / .ply files in hymotion/assets/dump_wooden/
+        # back the WoodenMesh body-model loader; bundling them makes the wheel
+        # self-contained for `pip install`. Generic *.yml / *.yaml / *.txt entry
+        # preserves upstream behaviour for any other config files we add later.
         "": ["*.yml", "*.yaml", "*.json", "*.txt"],
+        "hymotion.assets.dump_wooden": ["*.bin", "*.webp", "*.json", "*.ply"],
     },
 )

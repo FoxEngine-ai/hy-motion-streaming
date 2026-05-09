@@ -1,0 +1,8 @@
+# Bundle the binary wooden-mesh assets into the wheel so WoodenMesh
+# works out-of-the-box after `pip install` without any auxiliary setup.
+recursive-include hymotion/assets *.bin *.webp *.json *.ply
+
+# Documentation files at the repo root that are useful next to an
+# installed package.
+include README.md
+include License.txt
