@@ -60,7 +60,7 @@ EXTRAS_REQUIRE["all"] = sorted(set(p for v in EXTRAS_REQUIRE.values() for p in v
 
 setup(
     name="hymotion",
-    version="1.1.3",
+    version="1.1.4",
     description=(
         "HY-Motion 1.0 (FoxEngine fork): Scaling Flow Matching Models for 3D Motion "
         "Generation. Adds pip-installability, GGUF/quantization, and streaming on "
