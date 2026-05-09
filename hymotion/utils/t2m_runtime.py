@@ -57,6 +57,16 @@ class T2MRuntime:
         use_gguf: bool = False,
     ):
         self.config_path = config_path
+        # Resolve a bare ckpt filename (e.g. "latest.ckpt") relative to the
+        # config file's directory. Without this, downstream code that does
+        # os.path.dirname(self.ckpt_name) gets an empty string when ckpt_name
+        # has no directory component, which then propagates as an empty path
+        # to load_in_demo() — manifesting as an "AssertionError on empty
+        # mean_std_name" because the pipeline can't locate the sibling
+        # statistics file. Absolute or already-relative-with-directory values
+        # are left alone.
+        if ckpt_name and not os.path.isabs(ckpt_name) and not os.path.dirname(ckpt_name):
+            ckpt_name = os.path.join(os.path.dirname(os.path.abspath(config_path)), ckpt_name)
         self.ckpt_name = ckpt_name
         self.skip_text = skip_text
         self.quantization_mode = quantization_mode
