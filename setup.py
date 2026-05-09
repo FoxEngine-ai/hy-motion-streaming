@@ -15,12 +15,16 @@ with open("requirements.txt", "r", encoding="utf-8") as f:
 
 setup(
     name="hymotion",
-    version="1.0.0",
-    description="HY-Motion 1.0: Scaling Flow Matching Models for 3D Motion Generation",
-    author="Tencent Hunyuan 3D Digital Human Team",
+    version="1.1.0",
+    description=(
+        "HY-Motion 1.0 (FoxEngine fork): Scaling Flow Matching Models for 3D Motion "
+        "Generation. Adds pip-installability, GGUF/quantization, and streaming on "
+        "top of Tencent's research release."
+    ),
+    author="Tencent Hunyuan 3D Digital Human Team (upstream); FoxEngine.ai (fork)",
     author_email="",
-    url="https://github.com/Tencent-Hunyuan/HY-Motion-1.0",
-    packages=find_packages(),
+    url="https://github.com/FoxEngine-ai/hy-motion-streaming",
+    packages=find_packages(include=["hymotion", "hymotion.*"]),
     install_requires=requirements,
     python_requires=">=3.8",
     classifiers=[
