@@ -145,6 +145,24 @@ class MotionGeneration(torch.nn.Module):
 
     def _load_mean_std(self, mean_std_name: Optional[str] = None) -> None:
         mean_std_name = self.mean_std_dir if mean_std_name is None else mean_std_name
+
+        # Fall back to the package-bundled stats if the configured path doesn't
+        # exist. The Mean.npy / Std.npy files are tiny (~4 KB each) and ship
+        # inside the wheel under hymotion/assets/stats/. The config-file default
+        # of "./stats/" only resolves when running from a source checkout, so
+        # any pip-installed caller would otherwise hit the blank-buffer fallback
+        # below and crash with a checkpoint-shape mismatch on load.
+        if mean_std_name is None or not osp.isdir(mean_std_name):
+            bundled = osp.join(
+                osp.dirname(osp.dirname(osp.abspath(__file__))), "assets", "stats"
+            )
+            if osp.isdir(bundled):
+                print(
+                    f"[{self.__class__.__name__}] Using bundled mean_std at {bundled} "
+                    f"(configured mean_std_dir={mean_std_name!r} not present)"
+                )
+                mean_std_name = bundled
+
         if mean_std_name is not None and osp.isdir(mean_std_name):
             mean = torch.from_numpy(np.load(osp.join(mean_std_name, "Mean.npy"))).float()
             std = torch.from_numpy(np.load(osp.join(mean_std_name, "Std.npy"))).float()
