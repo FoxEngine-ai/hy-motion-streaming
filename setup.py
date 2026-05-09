@@ -23,7 +23,12 @@ INSTALL_REQUIRES = [
     "torchdiffeq>=0.2.5",
     "einops>=0.8.1",
     "safetensors>=0.5.3",
-    "numpy>=1.24.0,<2.0",
+    # No upper bound on numpy: Tencent's ceiling of <2.0 reflected an older
+    # transformers/diffusers that hadn't migrated to numpy 2.x yet, but the
+    # versions we require here (transformers >= 4.53.3, diffusers >= 0.26.3)
+    # are numpy-2-compatible. Pinning <2.0 makes the wheel un-installable
+    # alongside numpy-2 ecosystem packages (exllamav3, etc).
+    "numpy>=1.24.0",
     "scipy>=1.10.0",
     "transforms3d>=0.4.2",
     "PyYAML>=6.0",
@@ -55,7 +60,7 @@ EXTRAS_REQUIRE["all"] = sorted(set(p for v in EXTRAS_REQUIRE.values() for p in v
 
 setup(
     name="hymotion",
-    version="1.1.1",
+    version="1.1.2",
     description=(
         "HY-Motion 1.0 (FoxEngine fork): Scaling Flow Matching Models for 3D Motion "
         "Generation. Adds pip-installability, GGUF/quantization, and streaming on "
