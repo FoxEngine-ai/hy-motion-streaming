@@ -10,10 +10,15 @@ from torch import Tensor
 
 _FILE_ACCESS_LOCK = threading.Lock()
 
-# Template directory path
+# Template directory path. Bundled inside the package at hymotion/assets/templates/
+# so it ships with the wheel and resolves the same whether the caller is running
+# from a source checkout or a pip install. (Earlier versions resolved
+# "../../scripts/gradio/templates" relative to this file, which only worked from
+# a source checkout — pip-installed callers got a FileNotFoundError out of
+# generate_static_html_content.)
 _TEMPLATE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-    "scripts", "gradio", "templates"
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "assets", "templates"
 )
 
 
